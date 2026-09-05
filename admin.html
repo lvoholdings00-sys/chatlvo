@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>LVO — manage members</title>
+<link rel="stylesheet" href="app.css" />
+<style>
+  .admin-wrap { max-width: 720px; margin: 0 auto; padding: 32px 24px 80px; }
+  .admin-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; }
+  .admin-title { font-family: var(--font-mono); font-size: 18px; margin: 0; }
+  .card { border: 1px solid var(--hairline); border-radius: var(--radius); background: var(--panel); padding: 20px; margin-bottom: 20px; }
+  .card h2 { font-size: 14px; margin: 0 0 14px; color: var(--text-muted); font-family: var(--font-mono); font-weight: 500; }
+  .form-row { display: flex; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+  .form-row input { flex: 1; min-width: 140px; }
+  .user-row { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--hairline); }
+  .user-row:last-child { border-bottom: none; }
+  .user-meta { flex: 1; min-width: 0; }
+  .user-id { font-family: var(--font-mono); font-size: 12.5px; color: var(--text-muted); }
+  .user-actions { display: flex; gap: 6px; }
+  .user-actions button { font-size: 12px; padding: 6px 10px; width: auto; }
+  .back-link { color: var(--accent); font-size: 13px; text-decoration: none; }
+</style>
+</head>
+<body>
+<div class="admin-wrap">
+  <div class="admin-top">
+    <h1 class="admin-title">LVO — manage members</h1>
+    <a class="back-link" href="index.html">← Back to chat</a>
+  </div>
+
+  <div id="not-admin" class="card hidden">
+    <p>You need to be signed in as the admin to see this page.</p>
+    <a class="back-link" href="index.html">← Back to chat</a>
+  </div>
+
+  <div id="admin-content" class="hidden">
+    <div class="card">
+      <h2>ADD A MEMBER</h2>
+      <div class="form-row">
+        <input id="new-username" placeholder="username" />
+        <input id="new-displayname" placeholder="display name (optional)" />
+      </div>
+      <div class="form-row">
+        <input id="new-password" placeholder="temporary password (8+ chars)" type="text" />
+        <button class="btn" id="create-btn" style="width:auto;">Add member</button>
+      </div>
+      <p class="hint-text">Give them the username and temporary password directly — they'll be asked to set their own password the first time they sign in.</p>
+      <p class="error-text" id="create-error"></p>
+    </div>
+
+    <div class="card">
+      <h2>MEMBERS</h2>
+      <div id="user-list"></div>
+    </div>
+  </div>
+</div>
+
+<script src="admin.js"></script>
+</body>
+</html>

@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>LVO — secure line</title>
+<link rel="stylesheet" href="app.css" />
+</head>
+<body>
+
+<!-- ---------------- Login ---------------- -->
+<section id="login-screen">
+  <form class="login-card" id="login-form">
+    <p class="wordmark">LVO</p>
+    <p class="tagline">Secure line. Members only — accounts are created by the admin.</p>
+
+    <div class="field">
+      <label for="login-username">Username</label>
+      <input id="login-username" type="text" autocomplete="username" required />
+    </div>
+    <div class="field">
+      <label for="login-password">Password</label>
+      <input id="login-password" type="password" autocomplete="current-password" required />
+    </div>
+    <button class="btn" type="submit" id="login-submit">Sign in</button>
+    <p class="error-text" id="login-error"></p>
+  </form>
+</section>
+
+<!-- ---------------- Force password change (first login) ---------------- -->
+<div class="modal-backdrop hidden" id="pwd-modal">
+  <div class="modal">
+    <h2>Set a new password</h2>
+    <p class="subhead">Your admin created this account with a temporary password. Choose your own before continuing.</p>
+    <div class="field">
+      <label for="pwd-new">New password (8+ characters)</label>
+      <input id="pwd-new" type="password" autocomplete="new-password" />
+    </div>
+    <p class="error-text" id="pwd-error"></p>
+    <div class="modal-actions">
+      <button class="btn" id="pwd-save">Save and continue</button>
+    </div>
+  </div>
+</div>
+
+<!-- ---------------- App ---------------- -->
+<section id="app-screen" class="hidden">
+  <aside class="rail">
+    <div class="rail-header">
+      <p class="rail-brand">LVO</p>
+      <div class="me-row">
+        <div class="avatar avatar-sm" id="me-avatar"></div>
+        <span class="me-name" id="me-name"></span>
+        <span class="leader-badge hidden" id="leader-badge">LEADER</span>
+        <button class="icon-btn" id="open-avatar-modal" title="Change your image">✎</button>
+      </div>
+    </div>
+
+    <p class="roster-label">MEMBERS</p>
+    <div class="roster-list" id="roster-list">
+      <p class="roster-empty">Loading…</p>
+    </div>
+
+    <div class="rail-footer">
+      <a class="btn btn-secondary hidden" id="admin-link" href="admin.html" style="text-decoration:none; text-align:center; flex:1;">Manage members</a>
+      <button class="btn btn-danger" id="logout-btn" style="flex:1;">Log out</button>
+    </div>
+  </aside>
+
+  <main class="chat-pane">
+    <div id="chat-empty" class="chat-empty">Pick a member from the left to start a secure conversation.</div>
+
+    <div id="chat-active" class="hidden" style="display:contents;">
+      <div class="chat-header">
+        <div class="avatar avatar-lg" id="peer-avatar"></div>
+        <div>
+          <div class="chat-peer-name" id="peer-name"></div>
+          <div class="chat-status"><span class="status-dot" id="status-dot"></span><span id="status-text">Connecting…</span></div>
+        </div>
+      </div>
+      <div class="messages" id="messages"></div>
+      <div class="composer">
+        <textarea id="composer-input" placeholder="Type a message…"></textarea>
+        <button class="btn" id="composer-send">Send</button>
+      </div>
+    </div>
+  </main>
+</section>
+
+<!-- ---------------- Avatar settings modal ---------------- -->
+<div class="modal-backdrop hidden" id="avatar-modal">
+  <div class="modal">
+    <h2>Your image</h2>
+    <p class="subhead">Shown to other members in the roster and in chat.</p>
+
+    <div class="tab-row">
+      <button class="tab-btn active" data-tab="presets">Choose an icon</button>
+      <button class="tab-btn" data-tab="upload">Upload a photo</button>
+    </div>
+
+    <div id="tab-presets">
+      <div class="preset-grid" id="preset-grid"></div>
+    </div>
+
+    <div id="tab-upload" class="hidden">
+      <div class="upload-row">
+        <div class="avatar avatar-xl" id="upload-preview"></div>
+        <input type="file" id="upload-input" accept="image/*" />
+      </div>
+      <p class="hint-text">JPG or PNG, under 350KB. It's resized to a small square avatar — no need to crop it yourself.</p>
+    </div>
+
+    <p class="error-text" id="avatar-error"></p>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" id="avatar-cancel" style="width:auto;">Close</button>
+    </div>
+  </div>
+</div>
+
+<script src="sdk/e2ee-sdk.bundle.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
