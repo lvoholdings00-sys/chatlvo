@@ -600,7 +600,9 @@ async function sendCurrentMessage() {
   try {
     if (selectedChannelId) {
       sendChannelMessage(selectedChannelId, text);
-      addBubble(text, 'mine');
+      // Do not addBubble here: the server echoes every room_message back to
+      // all channel members (including the sender), and the socket listener
+      // below already renders it. Rendering it here too caused duplicates.
     } else {
       await client.sendMessage(selectedPeerId, text);
       addBubble(text, 'mine');
@@ -884,8 +886,12 @@ async function boot() {
     els['pwd-modal'].classList.remove('hidden');
     return;
   }
-  showApp();
+  // Load the roster first: it's what populates presetsById, which
+  // renderAvatar() (called inside showApp()) depends on to resolve a
+  // preset-type avatar. Rendering before this resolved was causing the
+  // avatar to silently fall back to the letter-avatar look on every load.
   await loadRoster();
+  showApp();
   await loadChannels();
   await initClient();
 }
@@ -923,8 +929,8 @@ els['pwd-save'].addEventListener('click', async () => {
     session.user.mustChangePassword = false;
     saveSession(session);
     els['pwd-modal'].classList.add('hidden');
-    showApp();
     await loadRoster();
+    showApp();
     await loadChannels();
     await initClient();
   } catch (e) {
