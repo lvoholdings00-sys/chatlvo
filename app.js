@@ -9,7 +9,7 @@
  */
 
 // EDIT THIS to your deployed Worker URL (or custom domain).
-const SERVER_URL = 'https://lvo-chat-relay.YOUR-SUBDOMAIN.workers.dev';
+const SERVER_URL = 'https://lvo-chat-relay.lvoholdings00.workers.dev';
 
 const SESSION_KEY = 'lvo_session'; // { token, user } in localStorage
 
