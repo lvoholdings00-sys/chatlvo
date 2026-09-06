@@ -30705,6 +30705,28 @@
         const newState = { ...s, recvChainKey: b64(nextChainKey), recvCount: s.recvCount + 1 };
         return { newState, plaintextBytes };
       }
+      // --- Compliance sealing (disclosed audit logging) ---------------
+      // One-shot anonymous public-key encryption (libsodium sealed box)
+      // to a static "compliance" keypair. This is deliberately NOT part
+      // of the X3DH/ratchet session between the two chat participants —
+      // it does not weaken or touch their end-to-end session at all.
+      // The private half of this keypair must never live on the server;
+      // it is held offline by whoever is authorized to decrypt logs.
+      function generateComplianceKeypair() {
+        const kp = sodium.crypto_box_keypair();
+        return { publicKey: b64(kp.publicKey), privateKey: b64(kp.privateKey) };
+      }
+      function sealForCompliance(compliancePublicKeyB64, plaintextBytes) {
+        const sealed = sodium.crypto_box_seal(plaintextBytes, unb64(compliancePublicKeyB64));
+        return b64(sealed);
+      }
+      function openComplianceSeal(compliancePublicKeyB64, compliancePrivateKeyB64, sealedB64) {
+        return sodium.crypto_box_seal_open(
+          unb64(sealedB64),
+          unb64(compliancePublicKeyB64),
+          unb64(compliancePrivateKeyB64)
+        );
+      }
       module.exports = {
         ready,
         b64,
@@ -30719,7 +30741,10 @@
         ratchetInitSender,
         ratchetInitReceiver,
         encrypt,
-        decrypt
+        decrypt,
+        generateComplianceKeypair,
+        sealForCompliance,
+        openComplianceSeal
       };
     }
   });
@@ -30729,7 +30754,7 @@
     "client.js"(exports, module) {
       var crypto2 = require_crypto2();
       var E2EEClient2 = class {
-        constructor(userId, transport) {
+        constructor(userId, transport, compliancePublicKey = null) {
           this.userId = userId;
           this.transport = transport;
           this.identity = null;
@@ -30738,6 +30763,13 @@
           this.sessions = {};
           this.pendingHandshake = {};
           this.onMessage = null;
+          // Disclosed compliance public key (base64). When set, every
+          // outgoing message is additionally sealed to this key and sent
+          // alongside (not instead of) the normal E2EE envelope. This does
+          // not give the compliance key holder a live/decrypted view of
+          // the session \u2014 only an offline-decryptable sealed copy per
+          // message, stored server-side for later, disclosed audit access.
+          this.compliancePublicKey = compliancePublicKey;
         }
         /** Call once per device, first time this user ever uses the app. */
         async init() {
@@ -30771,12 +30803,19 @@
             await this._startSession(peerId);
           }
           const state = this.sessions[peerId];
-          const { newState, envelope } = crypto2.encrypt(state, new TextEncoder().encode(plaintext));
+          const plaintextBytes = new TextEncoder().encode(plaintext);
+          const { newState, envelope } = crypto2.encrypt(state, plaintextBytes);
           this.sessions[peerId] = newState;
           const isFirstMessage = !!this.pendingHandshake[peerId];
           const wire = isFirstMessage ? { type: "prekey_message", handshake: this.pendingHandshake[peerId], envelope, from: this.userId } : { type: "message", envelope, from: this.userId };
           if (isFirstMessage) delete this.pendingHandshake[peerId];
-          await this.transport.send(peerId, wire);
+          // Separate, disclosed compliance copy \u2014 sealed to a static
+          // public key, unrelated to the peer ratchet session above.
+          // Only sent if a compliance key was configured for this client.
+          const complianceWire = this.compliancePublicKey
+            ? crypto2.sealForCompliance(this.compliancePublicKey, plaintextBytes)
+            : null;
+          await this.transport.send(peerId, wire, complianceWire);
         }
         async _startSession(peerId) {
           const theirBundle = await this.transport.fetchBundle(peerId);
@@ -30852,8 +30891,10 @@
             if (!res.ok) throw new Error(`Failed to fetch bundle for ${uid}: ${res.status}`);
             return res.json();
           },
-          async send(toUserId, wire) {
-            socket.send(JSON.stringify({ type: "send", to: toUserId, wire }));
+          async send(toUserId, wire, complianceWire) {
+            const payload = { type: "send", to: toUserId, wire };
+            if (complianceWire) payload.complianceWire = complianceWire;
+            socket.send(JSON.stringify(payload));
           }
         };
         return { transport, socket };
