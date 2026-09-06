@@ -9,7 +9,7 @@
  */
 
 // EDIT THIS to your deployed Worker URL (or custom domain).
-const SERVER_URL = 'https://lvo-chat-relay.lvoholdings00.workers.dev';
+const SERVER_URL = 'https://lvo-chat-relay.YOUR-SUBDOMAIN.workers.dev';
 
 const SESSION_KEY = 'lvo_session'; // { token, user } in localStorage
 
@@ -128,8 +128,10 @@ function renderAvatar(container, userId, avatar, displayName) {
   container.innerHTML = '';
   if (avatar && avatar.type === 'preset' && presetsById[avatar.value]) {
     const p = presetsById[avatar.value];
-    container.style.background = p.color;
-    container.textContent = p.emoji;
+    container.style.background = 'var(--panel-raised)';
+    const img = document.createElement('img');
+    img.src = p.image;
+    container.appendChild(img);
     return;
   }
   if (avatar && avatar.type === 'upload') {
@@ -292,8 +294,10 @@ function buildPresetGrid() {
   for (const preset of Object.values(presetsById)) {
     const btn = document.createElement('button');
     btn.className = 'preset-choice' + (session.user.avatar && session.user.avatar.value === preset.id ? ' selected' : '');
-    btn.style.background = preset.color;
-    btn.textContent = preset.emoji;
+    btn.style.background = 'var(--panel-raised)';
+    const img = document.createElement('img');
+    img.src = preset.image;
+    btn.appendChild(img);
     btn.title = preset.id;
     btn.addEventListener('click', () => chooseImagePreset(preset.id));
     els['preset-grid'].appendChild(btn);
