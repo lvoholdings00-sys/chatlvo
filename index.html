@@ -84,8 +84,19 @@
         </div>
       </div>
       <div class="messages" id="messages"></div>
+
+      <div class="attachment-preview hidden" id="attachment-preview"></div>
+
       <p class="error-text" id="composer-error"></p>
       <div class="composer" id="composer-row">
+        <input
+          type="file"
+          id="composer-file-input"
+          class="hidden"
+          accept=".pdf,.txt,.png,.jpg,.jpeg,.gif,.webp,.heic,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm,.avi,.mkv"
+          multiple
+        />
+        <button class="icon-btn" type="button" id="composer-attach-btn" title="Attach a file">📎</button>
         <textarea id="composer-input" placeholder="Type a message…"></textarea>
         <button class="btn" id="composer-send">Send</button>
       </div>
@@ -208,6 +219,34 @@
     </div>
   </div>
 </section>
+
+<!-- ---------------- Attachment bubble template (cloned by app.js per message) ---------------- -->
+<template id="attachment-bubble-template">
+  <div class="attachment-bubble" data-kind="">
+    <a class="attachment-image-link" href="#" target="_blank" rel="noopener">
+      <img class="attachment-image hidden" alt="" />
+    </a>
+    <div class="attachment-file hidden">
+      <span class="attachment-file-icon"></span>
+      <div class="attachment-file-meta">
+        <span class="attachment-file-name"></span>
+        <span class="attachment-file-size"></span>
+      </div>
+      <a class="attachment-download-link" href="#" download>⬇</a>
+    </div>
+    <audio class="attachment-audio hidden" controls></audio>
+    <video class="attachment-video hidden" controls></video>
+  </div>
+</template>
+
+<!-- ---------------- Lightbox for image/video attachments ---------------- -->
+<div class="modal-backdrop hidden" id="lightbox-modal">
+  <div class="modal lightbox-modal">
+    <button class="icon-btn lightbox-close" id="lightbox-close" title="Close">✕</button>
+    <img class="lightbox-image hidden" id="lightbox-image" alt="" />
+    <video class="lightbox-video hidden" id="lightbox-video" controls></video>
+  </div>
+</div>
 
 <script src="sdk/e2ee-sdk.bundle.js"></script>
 <script src="app.js"></script>
