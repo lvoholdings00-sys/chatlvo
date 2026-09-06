@@ -30771,7 +30771,7 @@
             await this._startSession(peerId);
           }
           const state = this.sessions[peerId];
-          const { newState, envelope } = crypto2.encrypt(state, Buffer.from(plaintext, "utf8"));
+          const { newState, envelope } = crypto2.encrypt(state, new TextEncoder().encode(plaintext));
           this.sessions[peerId] = newState;
           const isFirstMessage = !!this.pendingHandshake[peerId];
           const wire = isFirstMessage ? { type: "prekey_message", handshake: this.pendingHandshake[peerId], envelope, from: this.userId } : { type: "message", envelope, from: this.userId };
@@ -30809,7 +30809,7 @@
           if (!state) throw new Error(`No session with ${wire.from} and this wasn't a handshake message.`);
           const { newState, plaintextBytes } = crypto2.decrypt(state, wire.envelope);
           this.sessions[wire.from] = newState;
-          const text = Buffer.from(plaintextBytes).toString("utf8");
+          const text = new TextDecoder("utf-8").decode(plaintextBytes);
           if (this.onMessage) this.onMessage(wire.from, text);
           return text;
         }
