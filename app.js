@@ -282,6 +282,16 @@ async function initClient() {
   const storageKey = `client:${session.user.id}`;
   const saved = await idbGet(storageKey);
 
+  // Disclosed compliance public key, served by the Worker so it can be
+  // rotated without a client redeploy. See /config endpoint spec.
+  let compliancePublicKey = null;
+  try {
+    const cfg = await api('/config', { token: session.token });
+    compliancePublicKey = cfg.compliancePublicKey || null;
+  } catch (e) {
+    console.warn('Could not load compliance config; sending without compliance seal.', e);
+  }
+
   const transportBundle = window.E2EE.createBrowserTransport({
     serverUrl: SERVER_URL,
     userId: session.user.id,
@@ -317,7 +327,7 @@ async function initClient() {
     }
   });
 
-  client = new window.E2EE.E2EEClient(session.user.id, transportBundle.transport);
+  client = new window.E2EE.E2EEClient(session.user.id, transportBundle.transport, compliancePublicKey);
   client.onMessage = async (from, text) => {
     await appendHistory(from, { from, text, ts: Date.now() });
     if (from === selectedPeerId) addBubble(text, 'theirs');
@@ -461,6 +471,15 @@ function showLogin() {
   els['app-screen'].classList.add('hidden');
 }
 
+function renderMonitoringBanner() {
+  if (document.getElementById('monitoring-banner')) return;
+  const banner = document.createElement('div');
+  banner.id = 'monitoring-banner';
+  banner.className = 'monitoring-banner';
+  banner.textContent = 'Messages sent through this workspace may be retained and reviewed by LVO administrators for compliance purposes.';
+  els['chat-active'].prepend(banner);
+}
+
 function showApp() {
   els['login-screen'].classList.add('hidden');
   els['app-screen'].classList.remove('hidden');
@@ -470,6 +489,7 @@ function showApp() {
     els['leader-badge'].classList.remove('hidden');
     els['admin-link'].classList.remove('hidden');
   }
+  renderMonitoringBanner();
 }
 
 async function boot() {
