@@ -476,7 +476,7 @@ function renderMonitoringBanner() {
   const banner = document.createElement('div');
   banner.id = 'monitoring-banner';
   banner.className = 'monitoring-banner';
-  banner.textContent = 'Messages sent through this workspace may be retained and reviewed by LVO administrators for compliance purposes.';
+  banner.textContent = 'Messages sent through this workspace may be retained and reviewed by LVO Legal Gatekeepers for compliance purposes.';
   els['chat-active'].prepend(banner);
 }
 
