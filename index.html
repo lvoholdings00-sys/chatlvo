@@ -56,19 +56,24 @@
       </div>
     </div>
 
+    <p class="roster-label" id="channels-label">CHANNELS</p>
+    <div class="roster-list channels-list" id="channels-list">
+      <p class="roster-empty">Loading…</p>
+    </div>
+
     <p class="roster-label">MEMBERS</p>
     <div class="roster-list" id="roster-list">
       <p class="roster-empty">Loading…</p>
     </div>
 
     <div class="rail-footer">
-      <a class="btn btn-secondary hidden" id="admin-link" href="admin.html" style="text-decoration:none; text-align:center; flex:1;">Manage members</a>
+      <button class="btn btn-secondary hidden" id="admin-link" style="flex:1;">Admin panel</button>
       <button class="btn btn-danger" id="logout-btn" style="flex:1;">Log out</button>
     </div>
   </aside>
 
   <main class="chat-pane">
-    <div id="chat-empty" class="chat-empty">Pick a member from the left to start a secure conversation.</div>
+    <div id="chat-empty" class="chat-empty">Pick a channel or a member from the left to start a conversation.</div>
 
     <div id="chat-active" class="hidden" style="display:contents;">
       <div class="chat-header">
@@ -79,10 +84,12 @@
         </div>
       </div>
       <div class="messages" id="messages"></div>
-      <div class="composer">
+      <p class="error-text" id="composer-error"></p>
+      <div class="composer" id="composer-row">
         <textarea id="composer-input" placeholder="Type a message…"></textarea>
         <button class="btn" id="composer-send">Send</button>
       </div>
+      <div class="composer-locked hidden" id="composer-locked">Only admins can post in this channel.</div>
     </div>
   </main>
 </section>
@@ -116,6 +123,91 @@
     </div>
   </div>
 </div>
+
+<!-- ---------------- Create channel modal ---------------- -->
+<div class="modal-backdrop hidden" id="channel-modal">
+  <div class="modal">
+    <h2>New channel</h2>
+    <p class="subhead">Group channels: everyone added can post. Announcement channels: only you (or people you grant) can post — everyone else reads.</p>
+    <div class="field">
+      <label for="channel-name">Name</label>
+      <input id="channel-name" type="text" placeholder="e.g. Vindex Ops" />
+    </div>
+    <div class="tab-row">
+      <button class="tab-btn active" data-channel-type="group">Group</button>
+      <button class="tab-btn" data-channel-type="announcement">Announcement</button>
+    </div>
+    <p class="roster-label" style="padding-left:0;">MEMBERS</p>
+    <div id="channel-member-picker" class="member-picker"></div>
+    <p class="error-text" id="channel-error"></p>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" id="channel-cancel" style="width:auto;">Cancel</button>
+      <button class="btn" id="channel-create" style="width:auto;">Create channel</button>
+    </div>
+  </div>
+</div>
+
+<!-- ---------------- Manage channel modal ---------------- -->
+<div class="modal-backdrop hidden" id="manage-channel-modal">
+  <div class="modal">
+    <h2 id="manage-channel-title">Manage channel</h2>
+    <p class="subhead" id="manage-channel-subhead"></p>
+    <div id="manage-channel-members"></div>
+    <p class="roster-label" style="padding-left:0;">ADD MEMBER</p>
+    <div class="form-row">
+      <select id="manage-channel-add-select"></select>
+      <button class="btn btn-secondary" id="manage-channel-add-btn" style="width:auto;">Add</button>
+    </div>
+    <p class="error-text" id="manage-channel-error"></p>
+    <div class="modal-actions">
+      <button class="btn btn-danger" id="manage-channel-delete" style="width:auto;">Delete channel</button>
+      <button class="btn btn-secondary" id="manage-channel-close" style="width:auto;">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- ---------------- Admin screen (in-page, no /admin.html route) ---------------- -->
+<section id="admin-screen" class="hidden">
+  <div class="admin-wrap">
+    <div class="admin-top">
+      <h1 class="admin-title">LVO — admin</h1>
+      <button class="back-link" id="close-admin">← Back to chat</button>
+    </div>
+
+    <div class="card">
+      <h2>ADD A MEMBER</h2>
+      <div class="form-row">
+        <input id="new-username" placeholder="username" />
+        <input id="new-displayname" placeholder="display name (optional)" />
+      </div>
+      <div class="form-row">
+        <input id="new-password" placeholder="temporary password (8+ chars)" type="text" />
+        <button class="btn" id="create-btn" style="width:auto;">Add member</button>
+      </div>
+      <p class="hint-text">Give them the username and temporary password directly — they'll be asked to set their own password the first time they sign in.</p>
+      <p class="error-text" id="create-error"></p>
+    </div>
+
+    <div class="card">
+      <h2>MEMBERS</h2>
+      <div id="user-list"></div>
+    </div>
+
+    <div class="card">
+      <div class="admin-top" style="margin-bottom:14px;">
+        <h2 style="margin:0;">CHANNELS</h2>
+        <button class="btn btn-secondary" id="admin-new-channel" style="width:auto;">+ New channel</button>
+      </div>
+      <div id="admin-channel-list"></div>
+    </div>
+
+    <div class="card">
+      <h2>DIRECT MESSAGES</h2>
+      <p class="hint-text" style="margin-top:0;">Direct messages stay end-to-end encrypted — this shows only who's talked to whom and when, never message content.</p>
+      <div id="dm-thread-list"></div>
+    </div>
+  </div>
+</section>
 
 <script src="sdk/e2ee-sdk.bundle.js"></script>
 <script src="app.js"></script>
