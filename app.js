@@ -6,6 +6,10 @@
  * (window.E2EE) for the actual X3DH + Double Ratchet work. This file
  * only handles accounts, avatars, and UI — it never touches plaintext
  * before encryption or after decryption in a way that leaves this file.
+ *
+ * Also wires a plaintext "General" broadcast room over the same
+ * websocket (type: 'send', room: 'general', text) alongside the
+ * encrypted 1:1 channel.
  */
 
 // EDIT THIS to your deployed Worker URL (or custom domain).
@@ -83,6 +87,7 @@ let session = loadSession();
 let roster = [];
 let presetsById = {};
 let selectedPeerId = null;
+let selectedRoom = null; // 'general' | null — mutually exclusive with selectedPeerId
 let client = null;
 let socket = null;
 const avatarBlobCache = new Map(); // userId -> object URL
@@ -161,13 +166,33 @@ async function loadRoster() {
 
 function renderRoster() {
   els['roster-list'].innerHTML = '';
+
+  // Static "General" entry — always first, opens the broadcast room
+  // instead of a 1:1 thread.
+  const generalBtn = document.createElement('button');
+  generalBtn.className = 'roster-item roster-item-general' + (selectedRoom === 'general' ? ' active' : '');
+  const generalAvatar = document.createElement('div');
+  generalAvatar.className = 'avatar avatar-sm';
+  generalAvatar.style.background = 'var(--panel-raised)';
+  generalAvatar.textContent = '#';
+  const generalName = document.createElement('span');
+  generalName.className = 'roster-name';
+  generalName.textContent = 'General';
+  generalBtn.appendChild(generalAvatar);
+  generalBtn.appendChild(generalName);
+  generalBtn.addEventListener('click', selectGeneralRoom);
+  els['roster-list'].appendChild(generalBtn);
+
   if (roster.length === 0) {
-    els['roster-list'].innerHTML = '<p class="roster-empty">No other members yet. Ask your admin to add someone.</p>';
+    const empty = document.createElement('p');
+    empty.className = 'roster-empty';
+    empty.textContent = 'No other members yet. Ask your admin to add someone.';
+    els['roster-list'].appendChild(empty);
     return;
   }
   for (const member of roster) {
     const btn = document.createElement('button');
-    btn.className = 'roster-item' + (member.id === selectedPeerId ? ' active' : '');
+    btn.className = 'roster-item' + (member.id === selectedPeerId && !selectedRoom ? ' active' : '');
     const avatarEl = document.createElement('div');
     avatarEl.className = 'avatar avatar-sm';
     renderAvatar(avatarEl, member.id, member.avatar, member.displayName);
@@ -210,6 +235,48 @@ async function appendHistory(peerId, entry) {
   await idbSet(`history:${session.user.id}`, all);
 }
 
+// ---------------------------------------------------------------------
+// General room (plaintext broadcast)
+// ---------------------------------------------------------------------
+async function loadGeneralHistory() {
+  // Expected shape: { messages: [{ from, fromName, text, ts }, ...] }
+  // Adjust field names below if the real API response differs.
+  const data = await api('/rooms/general/messages', { token: session.token });
+  return data.messages || [];
+}
+
+async function selectGeneralRoom() {
+  selectedRoom = 'general';
+  selectedPeerId = null;
+  renderRoster();
+
+  els['chat-empty'].classList.add('hidden');
+  els['chat-active'].classList.remove('hidden');
+  els['peer-avatar'].innerHTML = '';
+  els['peer-avatar'].style.background = 'var(--panel-raised)';
+  els['peer-avatar'].textContent = '#';
+  els['peer-name'].textContent = 'General';
+  setStatus(
+    socket && socket.readyState === 1 ? 'secured' : '',
+    socket && socket.readyState === 1 ? 'Connected' : 'Connecting…'
+  );
+
+  els['messages'].innerHTML = '';
+  const history = await loadGeneralHistory();
+  if (history.length === 0) {
+    addBubble('No messages yet in General.', 'system');
+  }
+  for (const entry of history) {
+    const label = entry.fromName || entry.from;
+    addBubble(`${label}: ${entry.text}`, entry.from === session.user.id ? 'mine' : 'theirs');
+  }
+}
+
+function sendGeneralMessage(text) {
+  if (!socket || socket.readyState !== 1) throw new Error('Not connected.');
+  socket.send(JSON.stringify({ type: 'send', room: 'general', text }));
+}
+
 async function initClient() {
   await window.E2EE.crypto.ready();
   const storageKey = `client:${session.user.id}`;
@@ -232,6 +299,24 @@ async function initClient() {
   socket = transportBundle.socket;
   socket.addEventListener('close', () => setStatus('error', 'Disconnected'));
 
+  // Second listener on the same socket, scoped to General-room broadcasts
+  // only. This does not interfere with whatever listener the SDK bundle
+  // attaches above for encrypted 1:1 traffic — it ignores every message
+  // that isn't a room_message for 'general'.
+  socket.addEventListener('message', (ev) => {
+    let payload;
+    try {
+      payload = JSON.parse(ev.data);
+    } catch {
+      return; // not JSON (e.g. raw E2EE wire frame) — not ours to handle
+    }
+    if (payload.type !== 'room_message' || payload.room !== 'general') return;
+    if (selectedRoom === 'general') {
+      const label = payload.fromName || payload.from;
+      addBubble(`${label}: ${payload.text}`, payload.from === session.user.id ? 'mine' : 'theirs');
+    }
+  });
+
   client = new window.E2EE.E2EEClient(session.user.id, transportBundle.transport);
   client.onMessage = async (from, text) => {
     await appendHistory(from, { from, text, ts: Date.now() });
@@ -249,6 +334,7 @@ async function initClient() {
 
 async function selectPeer(peerId) {
   selectedPeerId = peerId;
+  selectedRoom = null;
   renderRoster();
   const member = roster.find((m) => m.id === peerId);
   els['chat-empty'].classList.add('hidden');
@@ -269,14 +355,21 @@ async function selectPeer(peerId) {
 
 async function sendCurrentMessage() {
   const text = els['composer-input'].value.trim();
-  if (!text || !selectedPeerId) return;
+  if (!text) return;
+  if (!selectedPeerId && selectedRoom !== 'general') return;
+
   els['composer-input'].value = '';
   els['composer-send'].disabled = true;
   try {
-    await client.sendMessage(selectedPeerId, text);
-    addBubble(text, 'mine');
-    await appendHistory(selectedPeerId, { from: session.user.id, text, ts: Date.now() });
-    await idbSet(`client:${session.user.id}`, client.export());
+    if (selectedRoom === 'general') {
+      sendGeneralMessage(text);
+      addBubble(text, 'mine');
+    } else {
+      await client.sendMessage(selectedPeerId, text);
+      addBubble(text, 'mine');
+      await appendHistory(selectedPeerId, { from: session.user.id, text, ts: Date.now() });
+      await idbSet(`client:${session.user.id}`, client.export());
+    }
   } catch (e) {
     console.error(e);
     addBubble(`Failed to send: ${e.message}`, 'system');
