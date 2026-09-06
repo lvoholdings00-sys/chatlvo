@@ -3,22 +3,30 @@
  *
  * Wires: login -> roster (admin-controlled account list) -> E2EE chat
  * per selected member, using the SDK bundle from sdk/e2ee-sdk.bundle.js
- * (window.E2EE) for the actual X3DH + Double Ratchet work. This file
- * only handles accounts, avatars, and UI — it never touches plaintext
- * before encryption or after decryption in a way that leaves this file.
+ * (window.E2EE) for the actual X3DH + Double Ratchet work. Direct
+ * messages are never touched in plaintext by this file before
+ * encryption or after decryption in a way that leaves this file.
  *
- * Also wires a plaintext "General" broadcast room over the same
- * websocket (type: 'send', room: 'general', text) alongside the
- * encrypted 1:1 channel.
+ * Channels (General / Group / Announcement) are a separate, plaintext,
+ * server-stored broadcast system — sent as `room_send` over the same
+ * websocket, persisted server-side, and visible to admins for
+ * oversight. That's a deliberate trade-off, not an oversight: direct
+ * messages are the secure line, channels are the compliance-monitored
+ * team space (same idea "General" always advertised, now finished and
+ * extended to Group/Announcement channels).
+ *
+ * The admin panel (member management, channel management, DM activity
+ * overview) lives in this same page as a toggled view — there is no
+ * separate admin.html route, so the URL never changes.
  */
 
-// EDIT THIS to your deployed Worker URL (or custom domain).
+
 const SERVER_URL = 'https://lvo-chat-relay.lvoholdings00.workers.dev';
 
 const SESSION_KEY = 'lvo_session'; // { token, user } in localStorage
 
 // ---------------------------------------------------------------------
-// tiny IndexedDB key-value store (crypto key material + local message log)
+// tiny IndexedDB key-value store (crypto key material + local DM log)
 // ---------------------------------------------------------------------
 function idbGet(key) {
   return new Promise((resolve) => {
@@ -86,22 +94,30 @@ async function api(path, { method = 'GET', body, token, rawBody, contentType } =
 let session = loadSession();
 let roster = [];
 let presetsById = {};
+let channels = []; // [{id, name, type, memberCount, canPost}]
 let selectedPeerId = null;
-let selectedRoom = null; // 'general' | null — mutually exclusive with selectedPeerId
+let selectedChannelId = null; // mutually exclusive with selectedPeerId
 let client = null;
 let socket = null;
 const avatarBlobCache = new Map(); // userId -> object URL
+const channelTypeById = {}; // scratch used while building the create-channel modal
 
 const els = {};
 [
   'login-screen', 'login-form', 'login-username', 'login-password', 'login-submit', 'login-error',
   'pwd-modal', 'pwd-new', 'pwd-error', 'pwd-save',
   'app-screen', 'me-avatar', 'me-name', 'leader-badge', 'open-avatar-modal',
-  'roster-list', 'admin-link', 'logout-btn',
+  'channels-list', 'roster-list', 'admin-link', 'logout-btn',
   'chat-empty', 'chat-active', 'peer-avatar', 'peer-name', 'status-dot', 'status-text',
-  'messages', 'composer-input', 'composer-send',
+  'messages', 'composer-input', 'composer-send', 'composer-row', 'composer-error', 'composer-locked',
   'avatar-modal', 'preset-grid', 'upload-preview', 'upload-input', 'avatar-error', 'avatar-cancel',
   'tab-presets', 'tab-upload',
+  'channel-modal', 'channel-name', 'channel-member-picker', 'channel-error', 'channel-cancel', 'channel-create',
+  'manage-channel-modal', 'manage-channel-title', 'manage-channel-subhead', 'manage-channel-members',
+  'manage-channel-add-select', 'manage-channel-add-btn', 'manage-channel-error', 'manage-channel-delete', 'manage-channel-close',
+  'admin-screen', 'close-admin',
+  'new-username', 'new-displayname', 'new-password', 'create-btn', 'create-error', 'user-list',
+  'admin-new-channel', 'admin-channel-list', 'dm-thread-list',
 ].forEach((id) => (els[id] = document.getElementById(id)));
 
 // ---------------------------------------------------------------------
@@ -166,23 +182,6 @@ async function loadRoster() {
 
 function renderRoster() {
   els['roster-list'].innerHTML = '';
-
-  // Static "General" entry — always first, opens the broadcast room
-  // instead of a 1:1 thread.
-  const generalBtn = document.createElement('button');
-  generalBtn.className = 'roster-item roster-item-general' + (selectedRoom === 'general' ? ' active' : '');
-  const generalAvatar = document.createElement('div');
-  generalAvatar.className = 'avatar avatar-sm';
-  generalAvatar.style.background = 'var(--panel-raised)';
-  generalAvatar.textContent = '#';
-  const generalName = document.createElement('span');
-  generalName.className = 'roster-name';
-  generalName.textContent = 'General';
-  generalBtn.appendChild(generalAvatar);
-  generalBtn.appendChild(generalName);
-  generalBtn.addEventListener('click', selectGeneralRoom);
-  els['roster-list'].appendChild(generalBtn);
-
   if (roster.length === 0) {
     const empty = document.createElement('p');
     empty.className = 'roster-empty';
@@ -192,7 +191,7 @@ function renderRoster() {
   }
   for (const member of roster) {
     const btn = document.createElement('button');
-    btn.className = 'roster-item' + (member.id === selectedPeerId && !selectedRoom ? ' active' : '');
+    btn.className = 'roster-item' + (member.id === selectedPeerId && !selectedChannelId ? ' active' : '');
     const avatarEl = document.createElement('div');
     avatarEl.className = 'avatar avatar-sm';
     renderAvatar(avatarEl, member.id, member.avatar, member.displayName);
@@ -205,6 +204,275 @@ function renderRoster() {
     els['roster-list'].appendChild(btn);
   }
 }
+
+// ---------------------------------------------------------------------
+// channels (General / Group / Announcement — plaintext, server-stored)
+// ---------------------------------------------------------------------
+function channelIcon(type) {
+  if (type === 'announcement') return '📣';
+  return '#';
+}
+
+async function loadChannels() {
+  const data = await api('/channels', { token: session.token });
+  channels = data.channels;
+  renderChannels();
+}
+
+function renderChannels() {
+  els['channels-list'].innerHTML = '';
+  for (const ch of channels) {
+    const btn = document.createElement('button');
+    btn.className = 'roster-item' + (ch.id === selectedChannelId ? ' active' : '');
+    const icon = document.createElement('div');
+    icon.className = 'avatar avatar-sm';
+    icon.style.background = 'var(--panel-raised)';
+    icon.textContent = channelIcon(ch.type);
+    const name = document.createElement('span');
+    name.className = 'roster-name';
+    name.textContent = ch.name;
+    btn.appendChild(icon);
+    btn.appendChild(name);
+    if (ch.type === 'announcement' && !ch.canPost) {
+      const lock = document.createElement('span');
+      lock.className = 'read-only-badge';
+      lock.textContent = 'read-only';
+      btn.appendChild(lock);
+    }
+    btn.addEventListener('click', () => selectChannel(ch.id));
+    els['channels-list'].appendChild(btn);
+  }
+}
+
+async function loadChannelMessages(channelId) {
+  const data = await api(`/channels/${encodeURIComponent(channelId)}/messages`, { token: session.token });
+  return data.messages || [];
+}
+
+async function selectChannel(channelId) {
+  selectedChannelId = channelId;
+  selectedPeerId = null;
+  renderRoster();
+  renderChannels();
+
+  const ch = channels.find((c) => c.id === channelId);
+  els['chat-empty'].classList.add('hidden');
+  els['chat-active'].classList.remove('hidden');
+  els['peer-avatar'].innerHTML = '';
+  els['peer-avatar'].style.background = 'var(--panel-raised)';
+  els['peer-avatar'].textContent = channelIcon(ch ? ch.type : 'group');
+  els['peer-name'].textContent = ch ? ch.name : channelId;
+  setStatus(socket && socket.readyState === 1 ? 'secured' : '', socket && socket.readyState === 1 ? 'Connected' : 'Connecting…');
+
+  updateComposerForChannel(ch);
+  renderChannelBanner(ch);
+
+  els['messages'].innerHTML = '';
+  let history = [];
+  try {
+    history = await loadChannelMessages(channelId);
+  } catch (e) {
+    addBubble(`Could not load channel history: ${e.message}`, 'system');
+  }
+  if (history.length === 0) {
+    addBubble(`No messages yet in ${ch ? ch.name : 'this channel'}.`, 'system');
+  }
+  for (const entry of history) {
+    const label = entry.fromName || entry.from;
+    addBubble(`${label}: ${entry.text}`, entry.from === session.user.id ? 'mine' : 'theirs');
+  }
+}
+
+function updateComposerForChannel(ch) {
+  els['composer-error'].textContent = '';
+  const canPost = !ch || ch.canPost !== false;
+  els['composer-row'].classList.toggle('hidden', !canPost);
+  els['composer-locked'].classList.toggle('hidden', canPost);
+}
+
+function renderChannelBanner(ch) {
+  const existing = document.getElementById('monitoring-banner');
+  if (existing) existing.remove();
+  if (!ch) return;
+  const banner = document.createElement('div');
+  banner.id = 'monitoring-banner';
+  banner.className = 'monitoring-banner';
+  banner.textContent = 'Messages in this channel are stored and may be reviewed by LVO admins for compliance purposes.';
+  els['chat-active'].prepend(banner);
+}
+
+function sendChannelMessage(channelId, text) {
+  if (!socket || socket.readyState !== 1) throw new Error('Not connected.');
+  socket.send(JSON.stringify({ type: 'room_send', channelId, text }));
+}
+
+// ---------------------------------------------------------------------
+// create / manage channel modals (admin only)
+// ---------------------------------------------------------------------
+let pendingChannelType = 'group';
+
+function openChannelModal() {
+  els['channel-error'].textContent = '';
+  els['channel-name'].value = '';
+  pendingChannelType = 'group';
+  els['channel-modal'].querySelectorAll('[data-channel-type]').forEach((b) => {
+    b.classList.toggle('active', b.dataset.channelType === 'group');
+  });
+  els['channel-member-picker'].innerHTML = '';
+  for (const member of roster) {
+    const row = document.createElement('label');
+    row.className = 'member-picker-row';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.value = member.id;
+    row.appendChild(cb);
+    row.appendChild(document.createTextNode(' ' + member.displayName));
+    els['channel-member-picker'].appendChild(row);
+  }
+  els['channel-modal'].classList.remove('hidden');
+}
+
+els['channel-modal'] && els['channel-modal'].querySelectorAll('[data-channel-type]').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    pendingChannelType = btn.dataset.channelType;
+    els['channel-modal'].querySelectorAll('[data-channel-type]').forEach((b) => b.classList.toggle('active', b === btn));
+  });
+});
+
+els['channel-cancel'] && els['channel-cancel'].addEventListener('click', () => els['channel-modal'].classList.add('hidden'));
+
+els['channel-create'] && els['channel-create'].addEventListener('click', async () => {
+  els['channel-error'].textContent = '';
+  const name = els['channel-name'].value.trim();
+  if (!name) {
+    els['channel-error'].textContent = 'Channel name is required.';
+    return;
+  }
+  const memberIds = Array.from(els['channel-member-picker'].querySelectorAll('input:checked')).map((cb) => cb.value);
+  try {
+    await api('/channels', { method: 'POST', token: session.token, body: { name, type: pendingChannelType, memberIds } });
+    els['channel-modal'].classList.add('hidden');
+    await loadChannels();
+    await refreshAdminChannelList();
+  } catch (e) {
+    els['channel-error'].textContent = e.message;
+  }
+});
+
+let manageChannelId = null;
+
+async function openManageChannel(channelId) {
+  manageChannelId = channelId;
+  els['manage-channel-error'].textContent = '';
+  const data = await api('/channels', { token: session.token }); // for name/type context via admin list fallback
+  const adminList = await api('/admin/channels', { token: session.token });
+  const ch = adminList.channels.find((c) => c.id === channelId);
+  if (!ch) return;
+  els['manage-channel-title'].textContent = ch.name;
+  els['manage-channel-subhead'].textContent = ch.type === 'announcement'
+    ? 'Only members with posting rights can send here. Everyone else reads.'
+    : 'Everyone in this channel can post.';
+  els['manage-channel-delete'].classList.toggle('hidden', ch.id === 'general');
+
+  const membersData = await api(`/channels/${encodeURIComponent(channelId)}/members`, { token: session.token });
+  els['manage-channel-members'].innerHTML = '';
+  for (const m of membersData.members) {
+    const row = document.createElement('div');
+    row.className = 'user-row';
+    const meta = document.createElement('div');
+    meta.className = 'user-meta';
+    meta.innerHTML = `<div>${m.displayName}</div><div class="user-id">@${m.id}</div>`;
+    row.appendChild(meta);
+
+    if (ch.type === 'announcement') {
+      const label = document.createElement('label');
+      label.className = 'canpost-toggle';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = !!m.canPost;
+      cb.addEventListener('change', async () => {
+        try {
+          await api(`/channels/${encodeURIComponent(channelId)}`, {
+            method: 'PATCH',
+            token: session.token,
+            body: { setCanPost: { userId: m.id, canPost: cb.checked } },
+          });
+        } catch (e) {
+          els['manage-channel-error'].textContent = e.message;
+        }
+      });
+      label.appendChild(cb);
+      label.appendChild(document.createTextNode(' can post'));
+      row.appendChild(label);
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'user-actions';
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'btn btn-danger';
+    removeBtn.textContent = 'Remove';
+    removeBtn.addEventListener('click', async () => {
+      try {
+        await api(`/channels/${encodeURIComponent(channelId)}`, {
+          method: 'PATCH',
+          token: session.token,
+          body: { removeMemberIds: [m.id] },
+        });
+        await openManageChannel(channelId);
+        await loadChannels();
+      } catch (e) {
+        els['manage-channel-error'].textContent = e.message;
+      }
+    });
+    actions.appendChild(removeBtn);
+    row.appendChild(actions);
+    els['manage-channel-members'].appendChild(row);
+  }
+
+  const memberIds = new Set(membersData.members.map((m) => m.id));
+  els['manage-channel-add-select'].innerHTML = '';
+  const nonMembers = [session.user, ...roster].filter((u) => !memberIds.has(u.id));
+  for (const u of nonMembers) {
+    const opt = document.createElement('option');
+    opt.value = u.id;
+    opt.textContent = u.displayName;
+    els['manage-channel-add-select'].appendChild(opt);
+  }
+
+  els['manage-channel-modal'].classList.remove('hidden');
+}
+
+els['manage-channel-add-btn'] && els['manage-channel-add-btn'].addEventListener('click', async () => {
+  const uid = els['manage-channel-add-select'].value;
+  if (!uid || !manageChannelId) return;
+  try {
+    await api(`/channels/${encodeURIComponent(manageChannelId)}`, {
+      method: 'PATCH',
+      token: session.token,
+      body: { addMemberIds: [uid] },
+    });
+    await openManageChannel(manageChannelId);
+    await loadChannels();
+  } catch (e) {
+    els['manage-channel-error'].textContent = e.message;
+  }
+});
+
+els['manage-channel-delete'] && els['manage-channel-delete'].addEventListener('click', async () => {
+  if (!manageChannelId) return;
+  if (!confirm('Delete this channel? This removes it for everyone.')) return;
+  try {
+    await api(`/channels/${encodeURIComponent(manageChannelId)}`, { method: 'DELETE', token: session.token });
+    els['manage-channel-modal'].classList.add('hidden');
+    await loadChannels();
+    await refreshAdminChannelList();
+  } catch (e) {
+    els['manage-channel-error'].textContent = e.message;
+  }
+});
+
+els['manage-channel-close'] && els['manage-channel-close'].addEventListener('click', () => els['manage-channel-modal'].classList.add('hidden'));
+els['admin-new-channel'] && els['admin-new-channel'].addEventListener('click', openChannelModal);
 
 // ---------------------------------------------------------------------
 // chat / E2EE wiring
@@ -235,62 +503,10 @@ async function appendHistory(peerId, entry) {
   await idbSet(`history:${session.user.id}`, all);
 }
 
-// ---------------------------------------------------------------------
-// General room (plaintext broadcast)
-// ---------------------------------------------------------------------
-async function loadGeneralHistory() {
-  // Expected shape: { messages: [{ from, fromName, text, ts }, ...] }
-  // Adjust field names below if the real API response differs.
-  const data = await api('/rooms/general/messages', { token: session.token });
-  return data.messages || [];
-}
-
-async function selectGeneralRoom() {
-  selectedRoom = 'general';
-  selectedPeerId = null;
-  renderRoster();
-
-  els['chat-empty'].classList.add('hidden');
-  els['chat-active'].classList.remove('hidden');
-  els['peer-avatar'].innerHTML = '';
-  els['peer-avatar'].style.background = 'var(--panel-raised)';
-  els['peer-avatar'].textContent = '#';
-  els['peer-name'].textContent = 'General';
-  setStatus(
-    socket && socket.readyState === 1 ? 'secured' : '',
-    socket && socket.readyState === 1 ? 'Connected' : 'Connecting…'
-  );
-
-  els['messages'].innerHTML = '';
-  const history = await loadGeneralHistory();
-  if (history.length === 0) {
-    addBubble('No messages yet in General.', 'system');
-  }
-  for (const entry of history) {
-    const label = entry.fromName || entry.from;
-    addBubble(`${label}: ${entry.text}`, entry.from === session.user.id ? 'mine' : 'theirs');
-  }
-}
-
-function sendGeneralMessage(text) {
-  if (!socket || socket.readyState !== 1) throw new Error('Not connected.');
-  socket.send(JSON.stringify({ type: 'send', room: 'general', text }));
-}
-
 async function initClient() {
   await window.E2EE.crypto.ready();
   const storageKey = `client:${session.user.id}`;
   const saved = await idbGet(storageKey);
-
-  // Disclosed compliance public key, served by the Worker so it can be
-  // rotated without a client redeploy. See /config endpoint spec.
-  let compliancePublicKey = null;
-  try {
-    const cfg = await api('/config', { token: session.token });
-    compliancePublicKey = cfg.compliancePublicKey || null;
-  } catch (e) {
-    console.warn('Could not load compliance config; sending without compliance seal.', e);
-  }
 
   const transportBundle = window.E2EE.createBrowserTransport({
     serverUrl: SERVER_URL,
@@ -309,10 +525,9 @@ async function initClient() {
   socket = transportBundle.socket;
   socket.addEventListener('close', () => setStatus('error', 'Disconnected'));
 
-  // Second listener on the same socket, scoped to General-room broadcasts
-  // only. This does not interfere with whatever listener the SDK bundle
-  // attaches above for encrypted 1:1 traffic — it ignores every message
-  // that isn't a room_message for 'general'.
+  // Second listener on the same socket, scoped to channel broadcasts
+  // (room_message / room_error). Does not interfere with the SDK's own
+  // listener for encrypted 1:1 traffic — it ignores anything else.
   socket.addEventListener('message', (ev) => {
     let payload;
     try {
@@ -320,14 +535,21 @@ async function initClient() {
     } catch {
       return; // not JSON (e.g. raw E2EE wire frame) — not ours to handle
     }
-    if (payload.type !== 'room_message' || payload.room !== 'general') return;
-    if (selectedRoom === 'general') {
-      const label = payload.fromName || payload.from;
-      addBubble(`${label}: ${payload.text}`, payload.from === session.user.id ? 'mine' : 'theirs');
+    if (payload.type === 'room_message') {
+      if (selectedChannelId === payload.channelId) {
+        addBubble(`${payload.fromName || payload.from}: ${payload.text}`, payload.from === session.user.id ? 'mine' : 'theirs');
+      }
+      return;
+    }
+    if (payload.type === 'room_error') {
+      if (selectedChannelId === payload.channelId) {
+        els['composer-error'].textContent = payload.error;
+      }
+      return;
     }
   });
 
-  client = new window.E2EE.E2EEClient(session.user.id, transportBundle.transport, compliancePublicKey);
+  client = new window.E2EE.E2EEClient(session.user.id, transportBundle.transport);
   client.onMessage = async (from, text) => {
     await appendHistory(from, { from, text, ts: Date.now() });
     if (from === selectedPeerId) addBubble(text, 'theirs');
@@ -344,14 +566,18 @@ async function initClient() {
 
 async function selectPeer(peerId) {
   selectedPeerId = peerId;
-  selectedRoom = null;
+  selectedChannelId = null;
   renderRoster();
+  renderChannels();
   const member = roster.find((m) => m.id === peerId);
   els['chat-empty'].classList.add('hidden');
   els['chat-active'].classList.remove('hidden');
   renderAvatar(els['peer-avatar'], member.id, member.avatar, member.displayName);
   els['peer-name'].textContent = member.displayName;
   setStatus(socket && socket.readyState === 1 ? 'secured' : '', socket && socket.readyState === 1 ? 'Connected' : 'Connecting…');
+
+  updateComposerForChannel(null);
+  renderChannelBanner(null);
 
   els['messages'].innerHTML = '';
   const history = await loadHistory(peerId);
@@ -366,13 +592,14 @@ async function selectPeer(peerId) {
 async function sendCurrentMessage() {
   const text = els['composer-input'].value.trim();
   if (!text) return;
-  if (!selectedPeerId && selectedRoom !== 'general') return;
+  if (!selectedPeerId && !selectedChannelId) return;
 
   els['composer-input'].value = '';
   els['composer-send'].disabled = true;
+  els['composer-error'].textContent = '';
   try {
-    if (selectedRoom === 'general') {
-      sendGeneralMessage(text);
+    if (selectedChannelId) {
+      sendChannelMessage(selectedChannelId, text);
       addBubble(text, 'mine');
     } else {
       await client.sendMessage(selectedPeerId, text);
@@ -463,25 +690,172 @@ async function handleAvatarUpload(file) {
   }
 }
 
+// =======================================================================
+// Admin panel — merged from admin.js, shown/hidden in-page (no admin.html)
+// =======================================================================
+function showAdmin() {
+  els['app-screen'].classList.add('hidden');
+  els['admin-screen'].classList.remove('hidden');
+  refreshUserList().catch((e) => (els['create-error'].textContent = e.message));
+  refreshAdminChannelList().catch(() => {});
+  refreshDmThreads().catch(() => {});
+}
+function hideAdmin() {
+  els['admin-screen'].classList.add('hidden');
+  els['app-screen'].classList.remove('hidden');
+}
+
+async function refreshUserList() {
+  const { users } = await api('/admin/users', { token: session.token });
+  els['user-list'].innerHTML = '';
+  for (const u of users) {
+    const row = document.createElement('div');
+    row.className = 'user-row';
+
+    const meta = document.createElement('div');
+    meta.className = 'user-meta';
+    meta.innerHTML = `<div>${u.displayName}${u.role === 'admin' ? ' <span class="leader-badge">LEADER</span>' : ''}</div>
+                       <div class="user-id">@${u.id}${u.mustChangePassword ? ' · awaiting first sign-in' : ''}</div>`;
+
+    const actions = document.createElement('div');
+    actions.className = 'user-actions';
+
+    const resetBtn = document.createElement('button');
+    resetBtn.className = 'btn btn-secondary';
+    resetBtn.textContent = 'Reset password';
+    resetBtn.addEventListener('click', () => resetPassword(u.id));
+    actions.appendChild(resetBtn);
+
+    if (u.id !== session.user.id) {
+      const delBtn = document.createElement('button');
+      delBtn.className = 'btn btn-danger';
+      delBtn.textContent = 'Remove';
+      delBtn.addEventListener('click', () => removeUser(u.id, u.displayName));
+      actions.appendChild(delBtn);
+    }
+
+    row.appendChild(meta);
+    row.appendChild(actions);
+    els['user-list'].appendChild(row);
+  }
+}
+
+async function resetPassword(userId) {
+  const newPassword = prompt(`New temporary password for @${userId} (8+ characters):`);
+  if (!newPassword) return;
+  if (newPassword.length < 8) {
+    alert('Password must be at least 8 characters.');
+    return;
+  }
+  try {
+    await api(`/admin/users/${encodeURIComponent(userId)}/reset-password`, {
+      method: 'POST',
+      token: session.token,
+      body: { newPassword },
+    });
+    alert(`Password reset. Give @${userId} the new temporary password — they'll set their own at next sign-in.`);
+    await refreshUserList();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+async function removeUser(userId, displayName) {
+  if (!confirm(`Remove ${displayName} (@${userId})? This deletes their account and key bundle.`)) return;
+  try {
+    await api(`/admin/users/${encodeURIComponent(userId)}`, { method: 'DELETE', token: session.token });
+    await refreshUserList();
+    await loadRoster();
+    await loadChannels();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+els['create-btn'] && els['create-btn'].addEventListener('click', async () => {
+  els['create-error'].textContent = '';
+  const username = els['new-username'].value.trim();
+  const password = els['new-password'].value;
+  const displayName = els['new-displayname'].value.trim();
+  if (!username || !password) {
+    els['create-error'].textContent = 'Username and temporary password are required.';
+    return;
+  }
+  try {
+    await api('/admin/users', { method: 'POST', token: session.token, body: { username, password, displayName } });
+    els['new-username'].value = '';
+    els['new-displayname'].value = '';
+    els['new-password'].value = '';
+    await refreshUserList();
+  } catch (e) {
+    els['create-error'].textContent = e.message;
+  }
+});
+
+async function refreshAdminChannelList() {
+  const { channels: all } = await api('/admin/channels', { token: session.token });
+  els['admin-channel-list'].innerHTML = '';
+  for (const ch of all) {
+    const row = document.createElement('div');
+    row.className = 'user-row';
+    const meta = document.createElement('div');
+    meta.className = 'user-meta';
+    const last = ch.lastActivity ? new Date(ch.lastActivity).toLocaleString() : 'no messages yet';
+    meta.innerHTML = `<div>${channelIcon(ch.type)} ${ch.name} <span class="channel-type-badge">${ch.type}</span></div>
+                       <div class="user-id">${ch.memberCount} member${ch.memberCount === 1 ? '' : 's'} · ${ch.messageCount} message${ch.messageCount === 1 ? '' : 's'} · last: ${last}</div>`;
+    row.appendChild(meta);
+
+    const actions = document.createElement('div');
+    actions.className = 'user-actions';
+    if (ch.id !== 'general') {
+      const manageBtn = document.createElement('button');
+      manageBtn.className = 'btn btn-secondary';
+      manageBtn.textContent = 'Manage';
+      manageBtn.addEventListener('click', () => openManageChannel(ch.id));
+      actions.appendChild(manageBtn);
+    }
+    row.appendChild(actions);
+    els['admin-channel-list'].appendChild(row);
+  }
+}
+
+async function refreshDmThreads() {
+  const { threads } = await api('/admin/dm-threads', { token: session.token });
+  els['dm-thread-list'].innerHTML = '';
+  if (threads.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'roster-empty';
+    empty.textContent = 'No direct-message activity yet.';
+    els['dm-thread-list'].appendChild(empty);
+    return;
+  }
+  for (const t of threads) {
+    const row = document.createElement('div');
+    row.className = 'user-row';
+    const meta = document.createElement('div');
+    meta.className = 'user-meta';
+    meta.innerHTML = `<div>${t.userA.displayName} ↔ ${t.userB.displayName}</div>
+                       <div class="user-id">last activity: ${new Date(t.lastActivity).toLocaleString()}</div>`;
+    row.appendChild(meta);
+    els['dm-thread-list'].appendChild(row);
+  }
+}
+
+els['admin-link'] && els['admin-link'].addEventListener('click', showAdmin);
+els['close-admin'] && els['close-admin'].addEventListener('click', hideAdmin);
+
 // ---------------------------------------------------------------------
 // screen wiring
 // ---------------------------------------------------------------------
 function showLogin() {
   els['login-screen'].classList.remove('hidden');
   els['app-screen'].classList.add('hidden');
-}
-
-function renderMonitoringBanner() {
-  if (document.getElementById('monitoring-banner')) return;
-  const banner = document.createElement('div');
-  banner.id = 'monitoring-banner';
-  banner.className = 'monitoring-banner';
-  banner.textContent = 'Messages sent through this workspace may be retained and reviewed by LVO Legal Gatekeepers for compliance purposes.';
-  els['chat-active'].prepend(banner);
+  els['admin-screen'].classList.add('hidden');
 }
 
 function showApp() {
   els['login-screen'].classList.add('hidden');
+  els['admin-screen'].classList.add('hidden');
   els['app-screen'].classList.remove('hidden');
   els['me-name'].textContent = session.user.displayName;
   renderAvatar(els['me-avatar'], session.user.id, session.user.avatar, session.user.displayName);
@@ -489,7 +863,6 @@ function showApp() {
     els['leader-badge'].classList.remove('hidden');
     els['admin-link'].classList.remove('hidden');
   }
-  renderMonitoringBanner();
 }
 
 async function boot() {
@@ -513,6 +886,7 @@ async function boot() {
   }
   showApp();
   await loadRoster();
+  await loadChannels();
   await initClient();
 }
 
@@ -551,6 +925,7 @@ els['pwd-save'].addEventListener('click', async () => {
     els['pwd-modal'].classList.add('hidden');
     showApp();
     await loadRoster();
+    await loadChannels();
     await initClient();
   } catch (e) {
     els['pwd-error'].textContent = e.message;
@@ -582,9 +957,9 @@ els['open-avatar-modal'].addEventListener('click', () => {
   els['avatar-modal'].classList.remove('hidden');
 });
 els['avatar-cancel'].addEventListener('click', () => els['avatar-modal'].classList.add('hidden'));
-document.querySelectorAll('.tab-btn').forEach((btn) => {
+document.querySelectorAll('.tab-btn[data-tab]').forEach((btn) => {
   btn.addEventListener('click', () => {
-    document.querySelectorAll('.tab-btn').forEach((b) => b.classList.remove('active'));
+    document.querySelectorAll('.tab-btn[data-tab]').forEach((b) => b.classList.remove('active'));
     btn.classList.add('active');
     const tab = btn.dataset.tab;
     els['tab-presets'].classList.toggle('hidden', tab !== 'presets');
