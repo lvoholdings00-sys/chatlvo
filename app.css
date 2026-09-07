@@ -596,3 +596,32 @@ select {
   cursor: pointer;
   padding: 0;
 }
+
+/* ---------- Reactions: emoji picker (added for full-emoji-set reactions) ---------- */
+.reaction-picker { padding: 0; width: max-content; }
+emoji-picker {
+  --background: var(--panel-raised);
+  --border-color: var(--hairline);
+  --num-columns: 8;
+  width: 320px;
+  height: 360px;
+}
+
+/* ---------- GIFs (GIPHY search modal) ---------- */
+.gif-modal { width: 480px; }
+.gif-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  max-height: 360px;
+  overflow-y: auto;
+}
+.gif-choice {
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.gif-choice img { width: 100%; display: block; }
