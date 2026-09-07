@@ -1,4 +1,7 @@
-@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+/* Fonts are now loaded via <link> tags in index.html's <head> instead of
+   an @import here — an @import inside CSS forces the browser to fetch
+   and parse this whole file before it even discovers the font request,
+   adding a full extra round trip before text renders. */
 
 :root {
   --ink: #0a0a0c;
@@ -10,6 +13,7 @@
   --text-faint: #5c5b58;
   --accent: #4e8ca8;
   --accent-dim: #2c4e5c;
+  --accent-2: #7c5cff;
   --leader: #c8a96e;
   --danger: #b3564a;
   --radius: 2px;
@@ -67,6 +71,13 @@ input:focus, textarea:focus, button:focus-visible {
   align-items: center;
   justify-content: center;
   padding: 24px;
+}
+
+.login-back {
+  position: fixed;
+  top: 20px;
+  left: 24px;
+  z-index: 5;
 }
 
 .login-card {
@@ -273,6 +284,7 @@ input:focus, textarea:focus, button:focus-visible {
 }
 .roster-item:hover { background: var(--panel-raised); }
 .roster-item.active { background: var(--panel-raised); box-shadow: inset 2px 0 0 var(--accent); }
+.roster-item.active .avatar { box-shadow: 0 0 0 2px var(--ink), 0 0 0 4px var(--accent-2); }
 
 .roster-name {
   font-size: 13.5px;
@@ -365,6 +377,14 @@ input:focus, textarea:focus, button:focus-visible {
 .avatar-lg { width: 40px; height: 40px; font-size: 18px; }
 .avatar-xl { width: 64px; height: 64px; font-size: 30px; }
 
+/* Group/announcement channel icons get a gradient instead of the flat
+   panel background used for member avatars, so they read as distinct
+   "spaces" in the list the way Instagram group threads do. */
+.channel-icon {
+  background: linear-gradient(135deg, var(--accent-2), #ff5c8d);
+  color: #fff;
+}
+
 /* ---------- Chat pane ---------- */
 
 .chat-pane {
@@ -430,8 +450,16 @@ input:focus, textarea:focus, button:focus-visible {
   padding: 22px 24px;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 0;
 }
+
+/* Spacing between messages is margin-based (not a uniform flex gap) so
+   grouped/consecutive messages from the same sender can sit tighter
+   together, Instagram-DM style, instead of every message getting the
+   same amount of breathing room regardless of who sent it. */
+.messages > * { margin-top: 14px; }
+.messages > *:first-child { margin-top: 0; }
+.messages > .message.grouped { margin-top: 2px; }
 
 .bubble-row {
   display: flex;
@@ -476,6 +504,12 @@ input:focus, textarea:focus, button:focus-visible {
   margin-top: 18px;
   flex-shrink: 0;
 }
+/* Grouped messages (same sender, sent close together) hide the avatar
+   and the name/time row, but keep the avatar's layout space reserved
+   with visibility instead of display:none, so the text bubble above it
+   doesn't jump out of alignment. */
+.message.grouped .message-avatar { visibility: hidden; }
+.message.grouped .message-meta { display: none; }
 
 .message-body {
   display: flex;
@@ -524,7 +558,7 @@ input:focus, textarea:focus, button:focus-visible {
 .message-text {
   background: var(--panel-raised);
   border: 1px solid var(--hairline);
-  border-radius: 14px;
+  border-radius: 18px;
   padding: 9px 14px;
   font-size: 14px;
   line-height: 1.5;
@@ -533,8 +567,9 @@ input:focus, textarea:focus, button:focus-visible {
   white-space: pre-wrap;
 }
 .message.mine .message-text {
-  background: var(--accent-dim);
-  border-color: var(--accent);
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%);
+  border-color: transparent;
+  color: #fff;
 }
 .message.theirs .message-text { border-bottom-left-radius: 4px; }
 .message.mine .message-text { border-bottom-right-radius: 4px; }
@@ -564,13 +599,15 @@ input:focus, textarea:focus, button:focus-visible {
 
 .message-hover-actions {
   align-self: center;
+  display: flex;
+  gap: 2px;
   opacity: 0;
   pointer-events: none;
   transition: opacity .12s ease;
 }
 .message:hover .message-hover-actions,
 .message:focus-within .message-hover-actions { opacity: 1; pointer-events: auto; }
-.message-react-btn {
+.message-react-btn, .message-heart-btn {
   width: 28px;
   height: 28px;
   align-items: center;
@@ -579,6 +616,7 @@ input:focus, textarea:focus, button:focus-visible {
   color: var(--text-faint);
 }
 .message-react-btn:hover { color: var(--text); background: var(--panel-raised); }
+.message-heart-btn:hover { color: #ff5c8d; background: var(--panel-raised); }
 
 /* ---------- Attachments (images, files, audio, video bubbles) ---------- */
 
@@ -664,22 +702,72 @@ input:focus, textarea:focus, button:focus-visible {
 }
 .attachment-preview-chip .icon-btn { padding: 2px; }
 
+/* ---------- Composer (pill-shaped input + circular gradient send button,
+   Instagram-DM style, instead of a full-width text field + text button) ---------- */
+
 .composer {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   gap: 10px;
-  padding: 16px 24px;
+  padding: 12px 20px 18px;
   border-top: 1px solid var(--hairline);
   flex: 0 0 auto;
 }
-.composer textarea {
+
+.composer-pill {
   flex: 1;
-  resize: none;
-  height: 44px;
-  max-height: 140px;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  background: var(--panel-raised);
+  border: 1px solid var(--hairline);
+  border-radius: 999px;
+  padding: 6px 8px 6px 12px;
+  transition: border-color .15s;
 }
-.composer .btn { width: auto; padding: 0 22px; height: 44px; }
-.composer .icon-btn { height: 44px; align-items: center; justify-content: center; padding: 0 8px; }
+.composer-pill:focus-within { border-color: var(--accent-dim); }
+
+.composer-pill textarea {
+  flex: 1;
+  min-width: 0;
+  resize: none;
+  height: 22px;
+  max-height: 100px;
+  border: none;
+  background: transparent;
+  padding: 6px 4px;
+}
+
+.composer-pill .icon-btn {
+  height: 32px;
+  width: 32px;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  font-size: 11px;
+  font-family: var(--font-mono);
+}
+
+.composer-send-btn {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: none;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--panel-raised);
+  color: var(--text-faint);
+  transition: background .15s, color .15s, transform .1s;
+}
+.composer-send-btn.active {
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%);
+  color: #fff;
+}
+.composer-send-btn:active { transform: scale(0.9); }
 
 #composer-error { padding: 0 24px; flex: 0 0 auto; }
 
