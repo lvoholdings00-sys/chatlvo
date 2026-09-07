@@ -51,6 +51,7 @@
   <aside class="rail">
     <div class="rail-header">
       <p class="rail-brand">LVO</p>
+      <a class="back-to-site" href="https://online.lvo-cloud.cloud">← lvo-cloud.cloud</a>
       <div class="me-row">
         <div class="avatar avatar-sm" id="me-avatar"></div>
         <span class="me-name" id="me-name"></span>
@@ -70,8 +71,13 @@
     </div>
 
     <div class="rail-footer">
-      <button class="btn btn-secondary hidden" id="admin-link" style="flex:1;">Admin panel</button>
-      <button class="btn btn-danger" id="logout-btn" style="flex:1;">Log out</button>
+      <button class="icon-btn settings-btn" id="settings-btn" title="Settings">⚙</button>
+      <div class="settings-popover hidden" id="settings-popover">
+        <button class="settings-item" id="settings-avatar-btn">Change profile picture</button>
+        <button class="settings-item hidden" id="admin-link">Admin panel</button>
+        <div class="settings-divider"></div>
+        <button class="settings-item danger" id="logout-btn">Log out</button>
+      </div>
     </div>
   </aside>
 
