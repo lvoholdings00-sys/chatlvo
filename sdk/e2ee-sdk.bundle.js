@@ -30834,6 +30834,13 @@
         async receive(wire) {
           let state = this.sessions[wire.from];
           if (wire.type === "prekey_message") {
+            if (this.pendingHandshake[wire.from]) {
+              const weWin = this.identity.dhPublicKey > wire.handshake.identityKey;
+              if (weWin) {
+                throw new Error("Discarded a simultaneous handshake attempt (glare) — keeping our own session as initiator.");
+              }
+              delete this.pendingHandshake[wire.from];
+            }
             const otp = this.oneTimePrekeys.find((k) => k.keyId === wire.handshake.usedOneTimePrekeyId);
             const sharedSecret = crypto2.x3dhRespond(
               this.identity,
