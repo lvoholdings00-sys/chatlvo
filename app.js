@@ -19,6 +19,15 @@
  * overview) lives in this same page as a toggled view — there is no
  * separate admin.html route, so the URL never changes.
  *
+ * MOBILE NAV: below the 700px breakpoint (see app.css), #app-screen
+ * shows only one pane at a time — the roster/channel list, or the open
+ * chat — Telegram/Instagram style, instead of the two-column desktop
+ * layout. Selecting a channel or DM adds the "chat-open" class to
+ * #app-screen (CSS swaps which pane is visible); the back button in
+ * the chat header removes it again. This is a no-op above the
+ * breakpoint since the desktop grid always shows both panes regardless
+ * of the class.
+ *
  * PERFORMANCE NOTE: sdk/e2ee-sdk.bundle.js (the crypto library) and the
  * emoji-picker-element web component are both loaded lazily from this
  * file (see loadScriptOnce / ensureEmojiPicker below) instead of via
@@ -160,10 +169,10 @@ const els = {};
 [
   'login-screen', 'login-form', 'login-username', 'login-password', 'login-submit', 'login-error',
   'pwd-modal', 'pwd-new', 'pwd-error', 'pwd-save',
-  'app-screen', 'me-avatar', 'me-name', 'leader-badge', 'open-avatar-modal',
+  'app-screen', 'rail', 'chat-pane', 'me-avatar', 'me-name', 'leader-badge', 'open-avatar-modal',
   'channels-list', 'roster-list', 'admin-link', 'logout-btn',
   'settings-btn', 'settings-popover', 'settings-avatar-btn',
-  'chat-empty', 'chat-active', 'peer-avatar', 'peer-name', 'status-dot', 'status-text',
+  'chat-empty', 'chat-active', 'chat-back-btn', 'peer-avatar', 'peer-name', 'status-dot', 'status-text',
   'messages', 'composer-input', 'composer-send', 'composer-row', 'composer-error', 'composer-locked',
   'composer-file-input', 'composer-attach-btn', 'attachment-preview',
   'composer-gif-btn', 'gif-modal', 'gif-search-input', 'gif-grid', 'gif-error', 'gif-cancel',
@@ -177,6 +186,17 @@ const els = {};
   'new-username', 'new-displayname', 'new-password', 'create-btn', 'create-error', 'user-list',
   'admin-new-channel', 'admin-channel-list', 'dm-thread-list',
 ].forEach((id) => (els[id] = document.getElementById(id)));
+
+// ---------------------------------------------------------------------
+// mobile list <-> chat navigation (see MOBILE NAV note at top of file)
+// ---------------------------------------------------------------------
+function openChatPaneMobile() {
+  els['app-screen'].classList.add('chat-open');
+}
+function closeChatPaneMobile() {
+  els['app-screen'].classList.remove('chat-open');
+}
+els['chat-back-btn'] && els['chat-back-btn'].addEventListener('click', closeChatPaneMobile);
 
 // ---------------------------------------------------------------------
 // avatar rendering
@@ -793,6 +813,7 @@ async function selectChannel(channelId) {
   closeReactionPicker();
   renderRoster();
   renderChannels();
+  openChatPaneMobile();
 
   const ch = channels.find((c) => c.id === channelId);
   els['chat-empty'].classList.add('hidden');
@@ -1170,6 +1191,7 @@ async function selectPeer(peerId) {
   closeReactionPicker();
   renderRoster();
   renderChannels();
+  openChatPaneMobile();
   const member = roster.find((m) => m.id === peerId);
   els['chat-empty'].classList.add('hidden');
   els['chat-active'].classList.remove('hidden');
@@ -1529,6 +1551,7 @@ function showApp() {
   els['login-screen'].classList.add('hidden');
   els['admin-screen'].classList.add('hidden');
   els['app-screen'].classList.remove('hidden');
+  closeChatPaneMobile(); // land on the roster/channel list first on mobile, not a stale chat view
   els['me-name'].textContent = session.user.displayName;
   renderAvatar(els['me-avatar'], session.user.id, session.user.avatar, session.user.displayName);
   if (session.user.role === 'admin') {
