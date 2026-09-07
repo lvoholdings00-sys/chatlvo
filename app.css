@@ -23,6 +23,7 @@
 html, body {
   height: 100%;
   margin: 0;
+  overflow: hidden; /* the app manages its own internal scroll regions */
 }
 
 body {
@@ -59,7 +60,8 @@ input:focus, textarea:focus, button:focus-visible {
 /* ---------- Login ---------- */
 
 #login-screen {
-  min-height: 100vh;
+  height: 100vh;
+  overflow-y: auto;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -154,8 +156,10 @@ input:focus, textarea:focus, button:focus-visible {
 
 #app-screen {
   height: 100vh;
+  overflow: hidden;
   display: grid;
   grid-template-columns: 280px 1fr;
+  grid-template-rows: 100vh;
 }
 
 .rail {
@@ -164,11 +168,15 @@ input:focus, textarea:focus, button:focus-visible {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
 }
 
 .rail-header {
   padding: 20px 16px 16px;
   border-bottom: 1px solid var(--hairline);
+  flex: 0 0 auto;
 }
 
 .rail-brand {
@@ -176,8 +184,19 @@ input:focus, textarea:focus, button:focus-visible {
   font-weight: 500;
   font-size: 19px;
   letter-spacing: -0.01em;
+  margin: 0 0 4px;
+}
+
+.back-to-site {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  color: var(--text-faint);
+  text-decoration: none;
   margin: 0 0 14px;
 }
+.back-to-site:hover { color: var(--accent); }
 
 .me-row {
   display: flex;
@@ -217,19 +236,26 @@ input:focus, textarea:focus, button:focus-visible {
 .icon-btn:hover { color: var(--text); background: var(--panel-raised); }
 
 .roster-label {
-  padding: 18px 16px 8px;
+  padding: 16px 16px 8px;
   font-size: 11px;
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--text-faint);
   font-family: var(--font-mono);
+  flex: 0 0 auto;
 }
 
 .roster-list {
-  flex: 1;
   overflow-y: auto;
   padding: 0 8px 8px;
+  min-height: 0;
 }
+
+/* Members list takes remaining space; channels list is capped so a long
+   channel list can't push the members list (or the rail footer) off
+   screen — each scrolls independently instead of the whole page. */
+#roster-list { flex: 1 1 auto; }
+#channels-list { flex: 0 1 auto; max-height: 34vh; }
 
 .roster-item {
   display: flex;
@@ -263,12 +289,59 @@ input:focus, textarea:focus, button:focus-visible {
 }
 
 .rail-footer {
-  padding: 14px 16px;
+  padding: 12px 16px;
   border-top: 1px solid var(--hairline);
+  flex: 0 0 auto;
+  position: relative;
   display: flex;
-  gap: 8px;
 }
-.rail-footer .btn-secondary, .rail-footer .btn-danger { padding: 9px 10px; font-size: 11.5px; }
+
+.settings-btn {
+  width: 36px;
+  height: 36px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  font-size: 16px;
+}
+.settings-btn:hover { border-color: var(--accent-dim); background: var(--panel-raised); color: var(--text); }
+
+.settings-popover {
+  position: absolute;
+  left: 16px;
+  bottom: 58px;
+  width: 216px;
+  background: var(--panel);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  z-index: 20;
+}
+
+.settings-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  padding: 9px 10px;
+  font-size: 13px;
+  border-radius: var(--radius);
+  text-decoration: none;
+}
+.settings-item:hover { background: var(--panel-raised); }
+.settings-item.danger { color: var(--danger); }
+.settings-divider {
+  height: 1px;
+  background: var(--hairline);
+  margin: 4px 2px;
+}
 
 /* ---------- Avatar ---------- */
 
@@ -296,6 +369,9 @@ input:focus, textarea:focus, button:focus-visible {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
   background: var(--ink);
 }
 
@@ -305,6 +381,7 @@ input:focus, textarea:focus, button:focus-visible {
   gap: 12px;
   padding: 16px 24px;
   border-bottom: 1px solid var(--hairline);
+  flex: 0 0 auto;
 }
 
 .chat-peer-name {
@@ -328,6 +405,7 @@ input:focus, textarea:focus, button:focus-visible {
   height: 6px;
   border-radius: 50%;
   background: var(--text-faint);
+  flex-shrink: 0;
 }
 .status-dot.secured { background: var(--accent); }
 .status-dot.error { background: var(--danger); }
@@ -344,12 +422,13 @@ input:focus, textarea:focus, button:focus-visible {
 }
 
 .messages {
-  flex: 1;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
   padding: 22px 24px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 16px;
 }
 
 .bubble-row {
@@ -378,18 +457,230 @@ input:focus, textarea:focus, button:focus-visible {
   border: 1px dashed var(--hairline);
 }
 
+/* ---------- Messages-app style bubbles (avatar, name+time, bubble, reactions) ---------- */
+
+.message {
+  display: flex;
+  gap: 10px;
+  max-width: 66%;
+  align-self: flex-start;
+}
+.message.mine {
+  align-self: flex-end;
+  flex-direction: row-reverse;
+}
+
+.message-avatar {
+  margin-top: 18px;
+  flex-shrink: 0;
+}
+
+.message-body {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+.message.theirs .message-body { align-items: flex-start; }
+.message.mine .message-body { align-items: flex-end; }
+
+.message-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-family: var(--font-mono);
+  padding: 0 2px;
+}
+.message.mine .message-meta { flex-direction: row-reverse; }
+
+.message-author {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  font-weight: 500;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.message-time {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+.message-bubble {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.message.theirs .message-bubble { align-items: flex-start; }
+.message.mine .message-bubble { align-items: flex-end; }
+
+.message-attachments { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+
+.message-text {
+  background: var(--panel-raised);
+  border: 1px solid var(--hairline);
+  border-radius: 14px;
+  padding: 9px 14px;
+  font-size: 14px;
+  line-height: 1.5;
+  word-break: break-word;
+  max-width: 100%;
+  white-space: pre-wrap;
+}
+.message.mine .message-text {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+}
+.message.theirs .message-text { border-bottom-left-radius: 4px; }
+.message.mine .message-text { border-bottom-right-radius: 4px; }
+
+.message-reactions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 0 2px;
+}
+.message.mine .message-reactions { justify-content: flex-end; }
+
+.reaction-pill {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--panel-raised);
+  border: 1px solid var(--hairline);
+  border-radius: 999px;
+  padding: 2px 8px;
+  color: var(--text-muted);
+}
+.reaction-pill:hover { border-color: var(--accent-dim); }
+.reaction-pill.mine-reaction { border-color: var(--accent); color: var(--text); }
+.reaction-emoji { font-size: 13px; }
+.reaction-count { font-family: var(--font-mono); font-size: 10.5px; }
+
+.message-hover-actions {
+  align-self: center;
+  opacity: 0;
+  transition: opacity .12s ease;
+}
+.message:hover .message-hover-actions,
+.message:focus-within .message-hover-actions { opacity: 1; }
+.message-react-btn { font-size: 15px; }
+
+/* ---------- Attachments (images, files, audio, video bubbles) ---------- */
+
+.attachment-bubble { max-width: 280px; }
+
+.attachment-image-link { display: block; line-height: 0; }
+.attachment-image {
+  display: block;
+  width: 100%;
+  max-height: 320px;
+  object-fit: cover;
+  border-radius: 12px;
+  cursor: zoom-in;
+  border: 1px solid var(--hairline);
+}
+
+.attachment-file {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--panel-raised);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  min-width: 220px;
+}
+.attachment-file-icon { font-size: 20px; flex-shrink: 0; }
+.attachment-file-meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+.attachment-file-name {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attachment-file-size {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+}
+.attachment-download-link {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 16px;
+  flex-shrink: 0;
+  padding: 4px;
+}
+.attachment-download-link:hover { color: var(--text); }
+
+.attachment-audio { display: block; width: 260px; max-width: 100%; }
+.attachment-video {
+  display: block;
+  width: 100%;
+  max-height: 320px;
+  border-radius: 12px;
+  cursor: pointer;
+  border: 1px solid var(--hairline);
+}
+
+/* ---------- Composer attachment preview strip ---------- */
+
+.attachment-preview {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 24px 0;
+  flex: 0 0 auto;
+}
+.attachment-preview-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--panel-raised);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  padding: 6px 6px 6px 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.attachment-preview-chip .icon-btn { padding: 2px; }
+
 .composer {
   display: flex;
+  align-items: flex-end;
   gap: 10px;
   padding: 16px 24px;
   border-top: 1px solid var(--hairline);
+  flex: 0 0 auto;
 }
 .composer textarea {
   flex: 1;
   resize: none;
   height: 44px;
+  max-height: 140px;
 }
-.composer .btn { width: auto; padding: 0 22px; }
+.composer .btn { width: auto; padding: 0 22px; height: 44px; }
+.composer .icon-btn { height: 44px; align-items: center; justify-content: center; padding: 0 8px; }
+
+#composer-error { padding: 0 24px; flex: 0 0 auto; }
+
+.composer-locked {
+  padding: 14px 24px 20px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  border-top: 1px solid var(--hairline);
+  flex: 0 0 auto;
+}
 
 /* ---------- Modal ---------- */
 
@@ -401,6 +692,7 @@ input:focus, textarea:focus, button:focus-visible {
   align-items: center;
   justify-content: center;
   z-index: 10;
+  padding: 24px;
 }
 
 .modal {
@@ -412,6 +704,7 @@ input:focus, textarea:focus, button:focus-visible {
   padding: 26px;
   max-height: 85vh;
   overflow-y: auto;
+  position: relative;
 }
 
 .modal h2 {
@@ -478,6 +771,39 @@ input:focus, textarea:focus, button:focus-visible {
   margin-top: 20px;
 }
 
+/* ---------- Lightbox ---------- */
+
+.lightbox-modal {
+  background: transparent;
+  border: none;
+  padding: 0;
+  max-width: 92vw;
+  max-height: 92vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: visible;
+}
+.lightbox-image, .lightbox-video {
+  max-width: 92vw;
+  max-height: 88vh;
+  border-radius: var(--radius);
+  display: block;
+}
+.lightbox-close {
+  position: absolute;
+  top: -42px;
+  right: -6px;
+  color: var(--text);
+  background: var(--panel-raised);
+  border: 1px solid var(--hairline);
+  border-radius: 50%;
+  width: 32px;
+  height: 32px;
+  align-items: center;
+  justify-content: center;
+}
+
 /* ---------- Scrollbars ---------- */
 
 ::-webkit-scrollbar { width: 8px; }
@@ -488,10 +814,10 @@ input:focus, textarea:focus, button:focus-visible {
   #app-screen { grid-template-columns: 1fr; }
   .rail { display: none; }
   .rail.mobile-visible { display: flex; position: fixed; inset: 0; z-index: 5; width: auto; }
+  .message { max-width: 84%; }
 }
 
 /* ---------- Channels ---------- */
-.channels-list { max-height: 220px; }
 .read-only-badge {
   font-family: var(--font-mono);
   font-size: 9.5px;
@@ -503,14 +829,6 @@ input:focus, textarea:focus, button:focus-visible {
   padding: 2px 5px;
   white-space: nowrap;
 }
-.composer-locked {
-  padding: 14px 24px 20px;
-  color: var(--text-faint);
-  font-family: var(--font-mono);
-  font-size: 12px;
-  letter-spacing: 0.02em;
-  border-top: 1px solid var(--hairline);
-}
 .monitoring-banner {
   background: var(--panel-raised);
   border-bottom: 1px solid var(--hairline);
@@ -520,6 +838,7 @@ input:focus, textarea:focus, button:focus-visible {
   letter-spacing: 0.02em;
   padding: 8px 24px;
   text-align: center;
+  flex: 0 0 auto;
 }
 .member-picker {
   display: flex;
@@ -569,7 +888,7 @@ select {
 }
 /* ---------- Admin screen (in-page, replaces admin.html) ---------- */
 #admin-screen {
-  min-height: 100vh;
+  height: 100vh;
   overflow-y: auto;
   background: var(--ink);
 }
