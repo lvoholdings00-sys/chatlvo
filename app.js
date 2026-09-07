@@ -199,6 +199,122 @@ function closeChatPaneMobile() {
 els['chat-back-btn'] && els['chat-back-btn'].addEventListener('click', closeChatPaneMobile);
 
 // ---------------------------------------------------------------------
+// cross-device backup — lets logging into the same account on a second
+// device restore both its E2EE identity/session state and its decrypted
+// DM history, instead of starting cold with a brand-new identity and no
+// history (which is what happened before this).
+//
+// The server (see /me/backup in the Worker) only ever stores the
+// ciphertext blob below. The key that encrypts it is derived client-side
+// from the account's login password using PBKDF2 with its own random
+// salt — never the same salt or iteration count the server uses to hash
+// the password for auth — so this stays consistent with the rest of the
+// app's trust model: the server can't read it.
+//
+// Real limits worth knowing:
+//   - This only works on a device where the person has actually typed
+//     their password in this tab (fresh login, or the forced first-time
+//     password change). A reloaded tab with a persisted session token
+//     but no local IndexedDB state has to ask for the password once to
+//     attempt a restore (see the prompt() fallback in initClient below).
+//   - If the password changes, the old backup is invalidated server-side
+//     (see handleAdminResetPassword) since it was encrypted with a key
+//     derived from the old password. The next device that pushes a
+//     backup under the new password starts a fresh one.
+// ---------------------------------------------------------------------
+let sessionPassword = null; // in-memory only for this tab; never persisted to localStorage/IndexedDB
+let backupPushDebounce = null;
+const BACKUP_PBKDF2_ITERATIONS = 200_000;
+
+function bytesToB64(bytes) {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+function b64ToBytes(b64) {
+  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+}
+
+async function deriveBackupKey(password, saltB64) {
+  const salt = b64ToBytes(saltB64);
+  const keyMaterial = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations: BACKUP_PBKDF2_ITERATIONS, hash: 'SHA-256' },
+    keyMaterial,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+// Encrypts this device's exported E2EE client state + decrypted DM
+// history and pushes it to the server, reusing whatever salt is already
+// on file so every device deriving from the same password lands on the
+// same key. Best-effort — failures here should never block sending a
+// message, so callers just fire-and-forget this via scheduleBackupPush.
+async function pushBackupToServer(password) {
+  if (!password || !client || !session) return;
+  try {
+    let saltB64;
+    try {
+      const existing = await api('/me/backup', { token: session.token });
+      saltB64 = existing.salt;
+    } catch {
+      saltB64 = bytesToB64(crypto.getRandomValues(new Uint8Array(16)));
+    }
+    const key = await deriveBackupKey(password, saltB64);
+    const history = (await idbGet(`history:${session.user.id}`)) || {};
+    const payload = { clientState: client.export(), history };
+    const plaintext = new TextEncoder().encode(JSON.stringify(payload));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plaintext);
+    await api('/me/backup', {
+      method: 'PUT',
+      token: session.token,
+      body: { salt: saltB64, iv: bytesToB64(iv), blob: bytesToB64(new Uint8Array(ciphertext)) },
+    });
+  } catch (e) {
+    console.error('Backup push failed (will retry after the next message)', e);
+  }
+}
+
+// Debounced so a burst of messages doesn't fire a PBKDF2 derivation +
+// upload per message — just once, ~2.5s after things settle.
+function scheduleBackupPush() {
+  if (!sessionPassword) return; // nothing in memory to encrypt with this session
+  clearTimeout(backupPushDebounce);
+  backupPushDebounce = setTimeout(() => pushBackupToServer(sessionPassword), 2500);
+}
+
+// Attempts to pull down and decrypt this account's server-side backup
+// (if any) using `password`, and if successful, seeds this device's local
+// IndexedDB with the restored identity/session state + history so the
+// normal initClient() flow picks it up as if it had always been there.
+// Returns false (not an error) when there's simply no backup yet — that's
+// the expected case for the very first device an account is ever used on.
+async function tryRestoreFromServerBackup(password) {
+  let data;
+  try {
+    data = await api('/me/backup', { token: session.token });
+  } catch {
+    return false;
+  }
+  try {
+    const key = await deriveBackupKey(password, data.salt);
+    const iv = b64ToBytes(data.iv);
+    const ciphertext = b64ToBytes(data.blob);
+    const plaintextBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
+    const payload = JSON.parse(new TextDecoder().decode(plaintextBuf));
+    await idbSet(`client:${session.user.id}`, payload.clientState);
+    await idbSet(`history:${session.user.id}`, payload.history || {});
+    return true;
+  } catch (e) {
+    console.error('Backup restore failed — wrong password derivation, or the backup predates a password change', e);
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------
 // avatar rendering
 // ---------------------------------------------------------------------
 async function getAvatarBlobUrl(userId) {
@@ -565,6 +681,7 @@ async function sendGif({ url, title }) {
       );
       await appendHistory(selectedPeerId, { from: session.user.id, text: JSON.stringify(descriptor), ts });
       await idbSet(`client:${session.user.id}`, client.export());
+      scheduleBackupPush();
     }
   } catch (e) {
     addBubble(`Failed to send GIF: ${e.message}`, 'system');
@@ -1069,7 +1186,33 @@ async function initClient() {
   await loadScriptOnce('sdk/e2ee-sdk.bundle.js'); // see PERFORMANCE NOTE at top of file
   await window.E2EE.crypto.ready();
   const storageKey = `client:${session.user.id}`;
-  const saved = await idbGet(storageKey);
+  let saved = await idbGet(storageKey);
+  if (!saved) {
+    // No local identity on this device yet. Before generating a brand new
+    // one (which would leave this device unable to read any existing DM
+    // history/sessions), see if there's a cross-device backup to restore.
+    let pw = sessionPassword;
+    if (!pw) {
+      // We got here via a persisted session token rather than a fresh
+      // login (e.g. this device's IndexedDB was cleared but localStorage
+      // wasn't) — no password in memory. Only bother asking for one if a
+      // backup actually exists; otherwise this is genuinely a first-ever
+      // device and there's nothing to restore.
+      try {
+        await api('/me/backup', { token: session.token });
+        pw = prompt('This device has no local secure-line history yet. Enter your password to restore it from your account backup:') || null;
+      } catch {
+        pw = null;
+      }
+    }
+    if (pw) {
+      const restored = await tryRestoreFromServerBackup(pw);
+      if (restored) {
+        sessionPassword = pw;
+        saved = await idbGet(storageKey);
+      }
+    }
+  }
 
   const transportBundle = window.E2EE.createBrowserTransport({
     serverUrl: SERVER_URL,
@@ -1141,6 +1284,7 @@ async function initClient() {
     await appendHistory(from, { from, text, ts });
     if (from === selectedPeerId) renderDmHistoryEntry({ from, text, ts });
     await idbSet(storageKey, client.export());
+    scheduleBackupPush();
   };
 
   if (saved) {
@@ -1149,6 +1293,7 @@ async function initClient() {
     await client.init();
   }
   await idbSet(storageKey, client.export());
+  scheduleBackupPush(); // make sure a backup exists even before the first message is sent/received
 }
 
 // A DM "message" from the wire is either plain chat text, or a JSON
@@ -1268,12 +1413,14 @@ async function sendCurrentMessage() {
         await appendHistory(selectedPeerId, { from: session.user.id, text, ts });
       }
       await idbSet(`client:${session.user.id}`, client.export());
+      scheduleBackupPush();
     } else {
       await client.sendMessage(selectedPeerId, text);
       const ts = Date.now();
       renderMessage({ id: `local-${ts}`, from: session.user.id, text, reactions: {}, ts }, 'mine', selectedPeerId, false);
       await appendHistory(selectedPeerId, { from: session.user.id, text, ts });
       await idbSet(`client:${session.user.id}`, client.export());
+      scheduleBackupPush();
     }
   } catch (e) {
     console.error(e);
@@ -1599,12 +1746,17 @@ els['login-form'].addEventListener('submit', async (e) => {
   els['login-error'].textContent = '';
   els['login-submit'].disabled = true;
   try {
+    const typedPassword = els['login-password'].value;
     const data = await api('/login', {
       method: 'POST',
-      body: { username: els['login-username'].value, password: els['login-password'].value },
+      body: { username: els['login-username'].value, password: typedPassword },
     });
     session = data;
     saveSession(session);
+    // Kept in memory only (never localStorage/IndexedDB) so this device can
+    // restore a cross-device backup if it has no local history yet, and so
+    // it can push its own backup as this session goes on. See initClient().
+    sessionPassword = typedPassword;
     await boot();
   } catch (e) {
     els['login-error'].textContent = e.message;
@@ -1625,6 +1777,7 @@ els['pwd-save'].addEventListener('click', async () => {
     await api('/me/password', { method: 'POST', token: session.token, body: { newPassword } });
     session.user.mustChangePassword = false;
     saveSession(session);
+    sessionPassword = newPassword; // this device now holds the account's real password — good for backup restore/push
     els['pwd-modal'].classList.add('hidden');
     await loadRoster();
     showApp();
@@ -1651,6 +1804,7 @@ els['logout-btn'].addEventListener('click', () => {
   clearSession();
   session = null;
   client = null;
+  sessionPassword = null;
   location.reload();
 });
 
