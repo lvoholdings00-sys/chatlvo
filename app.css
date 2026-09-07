@@ -60,7 +60,8 @@ input:focus, textarea:focus, button:focus-visible {
 /* ---------- Login ---------- */
 
 #login-screen {
-  height: 100vh;
+  position: fixed;
+  inset: 0;
   overflow-y: auto;
   display: flex;
   align-items: center;
@@ -155,11 +156,12 @@ input:focus, textarea:focus, button:focus-visible {
 /* ---------- App shell ---------- */
 
 #app-screen {
-  height: 100vh;
+  position: fixed;
+  inset: 0;
   overflow: hidden;
   display: grid;
   grid-template-columns: 280px 1fr;
-  grid-template-rows: 100vh;
+  grid-template-rows: 100%;
 }
 
 .rail {
@@ -563,11 +565,20 @@ input:focus, textarea:focus, button:focus-visible {
 .message-hover-actions {
   align-self: center;
   opacity: 0;
+  pointer-events: none;
   transition: opacity .12s ease;
 }
 .message:hover .message-hover-actions,
-.message:focus-within .message-hover-actions { opacity: 1; }
-.message-react-btn { font-size: 15px; }
+.message:focus-within .message-hover-actions { opacity: 1; pointer-events: auto; }
+.message-react-btn {
+  width: 28px;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  color: var(--text-faint);
+}
+.message-react-btn:hover { color: var(--text); background: var(--panel-raised); }
 
 /* ---------- Attachments (images, files, audio, video bubbles) ---------- */
 
@@ -888,7 +899,8 @@ select {
 }
 /* ---------- Admin screen (in-page, replaces admin.html) ---------- */
 #admin-screen {
-  height: 100vh;
+  position: fixed;
+  inset: 0;
   overflow-y: auto;
   background: var(--ink);
 }
