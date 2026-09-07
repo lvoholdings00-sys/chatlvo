@@ -25,6 +25,10 @@ const SERVER_URL = 'https://lvo-chat-relay.lvoholdings00.workers.dev';
 
 const SESSION_KEY = 'lvo_session'; // { token, user } in localStorage
 
+// GIPHY SDK key — safe to embed client-side (GIPHY's Web/JS SDK keys are
+// meant to ship in the frontend bundle, unlike a private server key).
+const GIPHY_API_KEY = 'n7IXLWcTUPp5fr5ZgJ7g7zNIs0Cn5PQE';
+
 // ---------------------------------------------------------------------
 // tiny IndexedDB key-value store (crypto key material + local DM log)
 // ---------------------------------------------------------------------
@@ -108,6 +112,7 @@ let pendingFiles = []; // File[] queued in the composer, not yet sent
 let channelMessageEls = {}; // messageId -> { el, reactions } for the currently-open channel only
 let reactionPickerCtx = null; // { channelId, messageId } the picker popup is currently anchored to
 const fileBlobCache = new Map(); // storageKey -> object URL, for plaintext channel attachments
+let gifSearchDebounce = null; // debounce handle for the GIF search box
 
 const els = {};
 [
@@ -118,6 +123,7 @@ const els = {};
   'chat-empty', 'chat-active', 'peer-avatar', 'peer-name', 'status-dot', 'status-text',
   'messages', 'composer-input', 'composer-send', 'composer-row', 'composer-error', 'composer-locked',
   'composer-file-input', 'composer-attach-btn', 'attachment-preview',
+  'composer-gif-btn', 'gif-modal', 'gif-search-input', 'gif-grid', 'gif-error', 'gif-cancel',
   'reaction-picker', 'lightbox-modal', 'lightbox-image', 'lightbox-video', 'lightbox-close',
   'avatar-modal', 'preset-grid', 'upload-preview', 'upload-input', 'avatar-error', 'avatar-cancel',
   'tab-presets', 'tab-upload',
@@ -277,7 +283,10 @@ async function uploadDmFile(peerId, file) {
 // Resolves an attachment descriptor to a displayable/downloadable blob URL.
 // `attachment.localUrl` is used for a file the current user just sent
 // (we already have the plaintext bytes, no need to round-trip the server).
+// `attachment.gifUrl` is used for GIPHY picks — GIPHY's CDN URL is used
+// directly, same trust tier as any other external image link.
 async function resolveAttachmentUrl(attachment, isChannel) {
+  if (attachment.gifUrl) return attachment.gifUrl;
   if (attachment.localUrl) return attachment.localUrl;
   if (isChannel) return getChannelFileBlobUrl(attachment.key);
   const res = await fetch(`${SERVER_URL}/files/${encodeURIComponent(attachment.storageKey)}`, {
@@ -415,6 +424,83 @@ els['composer-file-input'] && els['composer-file-input'].addEventListener('chang
 });
 
 // ---------------------------------------------------------------------
+// GIFs (GIPHY) — sent as an attachment carrying a direct gifUrl, so no
+// upload/download round-trip through your server or DM encryption is
+// needed (same trust model as any other external image link/embed).
+// ---------------------------------------------------------------------
+function openGifModal() {
+  if (!selectedPeerId && !selectedChannelId) return;
+  els['gif-error'].textContent = '';
+  els['gif-search-input'].value = '';
+  els['gif-grid'].innerHTML = '';
+  els['gif-modal'].classList.remove('hidden');
+  els['gif-search-input'].focus();
+  searchGifs('');
+}
+
+async function searchGifs(query) {
+  els['gif-error'].textContent = '';
+  els['gif-grid'].innerHTML = '<p class="roster-empty">Loading…</p>';
+  const endpoint = query
+    ? `https://api.giphy.com/v1/gifs/search?api_key=${GIPHY_API_KEY}&q=${encodeURIComponent(query)}&limit=24&rating=pg-13`
+    : `https://api.giphy.com/v1/gifs/trending?api_key=${GIPHY_API_KEY}&limit=24&rating=pg-13`;
+  try {
+    const res = await fetch(endpoint);
+    const data = await res.json();
+    els['gif-grid'].innerHTML = '';
+    if (!data.data || data.data.length === 0) {
+      els['gif-grid'].innerHTML = '<p class="roster-empty">No results.</p>';
+      return;
+    }
+    for (const gif of data.data) {
+      const thumb = gif.images.fixed_width_small || gif.images.fixed_width;
+      const full = gif.images.fixed_width || gif.images.original;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'gif-choice';
+      const img = document.createElement('img');
+      img.src = thumb.url;
+      img.alt = gif.title || 'GIF';
+      btn.appendChild(img);
+      btn.addEventListener('click', () => sendGif({ url: full.url, title: gif.title }));
+      els['gif-grid'].appendChild(btn);
+    }
+  } catch {
+    els['gif-error'].textContent = 'Could not load GIFs.';
+  }
+}
+
+els['gif-search-input'] && els['gif-search-input'].addEventListener('input', (e) => {
+  clearTimeout(gifSearchDebounce);
+  const q = e.target.value.trim();
+  gifSearchDebounce = setTimeout(() => searchGifs(q), 350);
+});
+els['gif-cancel'] && els['gif-cancel'].addEventListener('click', () => els['gif-modal'].classList.add('hidden'));
+els['composer-gif-btn'] && els['composer-gif-btn'].addEventListener('click', openGifModal);
+
+async function sendGif({ url, title }) {
+  els['gif-modal'].classList.add('hidden');
+  try {
+    if (selectedChannelId) {
+      sendChannelMessage(selectedChannelId, '', { gifUrl: url, filename: title || 'GIF', mime: 'image/gif' });
+      // socket listener renders the server echo — same as file attachments.
+    } else if (selectedPeerId) {
+      const descriptor = { __lvoAttachment: true, gifUrl: url, filename: title || 'GIF', mime: 'image/gif' };
+      await client.sendMessage(selectedPeerId, JSON.stringify(descriptor));
+      const ts = Date.now();
+      renderMessage(
+        { id: `local-${ts}`, from: session.user.id, text: '', attachment: { gifUrl: url, filename: title || 'GIF', mime: 'image/gif' }, reactions: {}, ts },
+        'mine', selectedPeerId, false
+      );
+      await appendHistory(selectedPeerId, { from: session.user.id, text: JSON.stringify(descriptor), ts });
+      await idbSet(`client:${session.user.id}`, client.export());
+    }
+  } catch (e) {
+    addBubble(`Failed to send GIF: ${e.message}`, 'system');
+  }
+}
+
+// ---------------------------------------------------------------------
 // reactions (channels only — the current backend has no DM reaction path)
 // ---------------------------------------------------------------------
 function renderReactionsInto(container, reactions, channelId, messageId) {
@@ -455,11 +541,13 @@ document.addEventListener('click', (e) => {
   if (!picker || picker.classList.contains('hidden')) return;
   if (!picker.contains(e.target) && !e.target.closest('.message-react-btn')) closeReactionPicker();
 });
-els['reaction-picker'] && els['reaction-picker'].querySelectorAll('.reaction-picker-emoji').forEach((btn) => {
-  btn.addEventListener('click', () => {
-    if (reactionPickerCtx) sendReaction(reactionPickerCtx.channelId, reactionPickerCtx.messageId, btn.dataset.emoji);
-    closeReactionPicker();
-  });
+// Full emoji set via the emoji-picker-element web component, replacing
+// the old hardcoded 6-button row.
+const emojiPickerEl = document.getElementById('emoji-picker-el');
+emojiPickerEl && emojiPickerEl.addEventListener('emoji-click', (e) => {
+  const emoji = e.detail.unicode;
+  if (reactionPickerCtx && emoji) sendReaction(reactionPickerCtx.channelId, reactionPickerCtx.messageId, emoji);
+  closeReactionPicker();
 });
 
 // ---------------------------------------------------------------------
@@ -943,8 +1031,8 @@ async function initClient() {
 }
 
 // A DM "message" from the wire is either plain chat text, or a JSON
-// attachment descriptor (see uploadDmFile / sendCurrentMessage) — this
-// tells the two apart and renders whichever it is.
+// attachment descriptor (see uploadDmFile / sendCurrentMessage / sendGif)
+// — this tells the two apart and renders whichever it is.
 function renderDmHistoryEntry(entry) {
   const kind = entry.from === session.user.id ? 'mine' : 'theirs';
   const descriptor = isAttachmentDescriptor(entry.text);
@@ -954,14 +1042,16 @@ function renderDmHistoryEntry(entry) {
         id: `${entry.ts}-${entry.from}`,
         from: entry.from,
         text: '',
-        attachment: {
-          storageKey: descriptor.storageKey,
-          filename: descriptor.filename,
-          mime: descriptor.mime,
-          size: descriptor.size,
-          cryptoKey: descriptor.cryptoKey,
-          iv: descriptor.iv,
-        },
+        attachment: descriptor.gifUrl
+          ? { gifUrl: descriptor.gifUrl, filename: descriptor.filename, mime: descriptor.mime }
+          : {
+              storageKey: descriptor.storageKey,
+              filename: descriptor.filename,
+              mime: descriptor.mime,
+              size: descriptor.size,
+              cryptoKey: descriptor.cryptoKey,
+              iv: descriptor.iv,
+            },
         reactions: {},
         ts: entry.ts,
       },
