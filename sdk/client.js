@@ -99,6 +99,28 @@ class E2EEClient {
     let state = this.sessions[wire.from];
 
     if (wire.type === 'prekey_message') {
+      // Glare: both sides independently called _startSession() for each
+      // other around the same time (e.g. right after both reset a broken
+      // session) before either had received the other's prekey_message.
+      // Without a tie-break, each side would just overwrite its session
+      // with whatever it receives, and there's no guarantee both sides
+      // converge on the SAME chain — leaving A permanently keyed to "B's
+      // initiation" and B permanently keyed to "A's initiation": two
+      // chains, neither matching what the other side actually has.
+      // Deterministically pick one initiator (higher identityKey wins,
+      // evaluated identically on both sides since it's a plain string
+      // compare of the same two keys) so both sides always land on the
+      // same single chain. The loser's in-flight message in this exact
+      // wire is unrecoverable (it was encrypted under a shared secret
+      // the winner never derives) and surfaces as a normal decrypt
+      // failure to the caller — everything sent after this resolves.
+      if (this.pendingHandshake[wire.from]) {
+        const weWin = this.identity.dhPublicKey > wire.handshake.identityKey;
+        if (weWin) {
+          throw new Error('Discarded a simultaneous handshake attempt (glare) — keeping our own session as initiator.');
+        }
+        delete this.pendingHandshake[wire.from]; // we lose the tie: abandon our own half-started session
+      }
       const otp = this.oneTimePrekeys.find((k) => k.keyId === wire.handshake.usedOneTimePrekeyId);
       const sharedSecret = crypto.x3dhRespond(
         this.identity,
