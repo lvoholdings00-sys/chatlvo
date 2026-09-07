@@ -18,6 +18,17 @@
  * The admin panel (member management, channel management, DM activity
  * overview) lives in this same page as a toggled view — there is no
  * separate admin.html route, so the URL never changes.
+ *
+ * PERFORMANCE NOTE: sdk/e2ee-sdk.bundle.js (the crypto library) and the
+ * emoji-picker-element web component are both loaded lazily from this
+ * file (see loadScriptOnce / ensureEmojiPicker below) instead of via
+ * <script> tags in index.html. Neither is needed to render or use the
+ * login screen, so loading them unconditionally on every page load was
+ * adding several seconds of dead weight before the login form was even
+ * usable. The SDK now loads right before it's first needed (inside
+ * initClient(), which only runs after a successful login), and the
+ * emoji picker is prefetched quietly in the background right after
+ * login so it's warm by the time someone opens the reaction picker.
  */
 
 
@@ -28,6 +39,32 @@ const SESSION_KEY = 'lvo_session'; // { token, user } in localStorage
 // GIPHY SDK key — safe to embed client-side (GIPHY's Web/JS SDK keys are
 // meant to ship in the frontend bundle, unlike a private server key).
 const GIPHY_API_KEY = 'n7IXLWcTUPp5fr5ZgJ7g7zNIs0Cn5PQE';
+
+// ---------------------------------------------------------------------
+// lazy asset loading (see PERFORMANCE NOTE above)
+// ---------------------------------------------------------------------
+function loadScriptOnce(src) {
+  return new Promise((resolve, reject) => {
+    if (document.querySelector(`script[data-lazy="${src}"]`)) {
+      resolve();
+      return;
+    }
+    const s = document.createElement('script');
+    s.src = src;
+    s.dataset.lazy = src;
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error(`Failed to load ${src}`));
+    document.head.appendChild(s);
+  });
+}
+
+let emojiPickerLoadPromise = null;
+function ensureEmojiPicker() {
+  if (!emojiPickerLoadPromise) {
+    emojiPickerLoadPromise = import('https://cdn.jsdelivr.net/npm/emoji-picker-element@^1/index.js');
+  }
+  return emojiPickerLoadPromise;
+}
 
 // ---------------------------------------------------------------------
 // tiny IndexedDB key-value store (crypto key material + local DM log)
@@ -114,6 +151,11 @@ let reactionPickerCtx = null; // { channelId, messageId } the picker popup is cu
 const fileBlobCache = new Map(); // storageKey -> object URL, for plaintext channel attachments
 let gifSearchDebounce = null; // debounce handle for the GIF search box
 
+// How close together (ms) two consecutive messages from the same sender
+// need to be to visually "group" them (hide the repeat avatar/name),
+// Instagram-DM style, instead of every message getting its own header.
+const GROUP_WINDOW_MS = 5 * 60 * 1000;
+
 const els = {};
 [
   'login-screen', 'login-form', 'login-username', 'login-password', 'login-submit', 'login-error',
@@ -163,6 +205,7 @@ function invalidateAvatarCache(userId) {
 
 function renderAvatar(container, userId, avatar, displayName) {
   container.innerHTML = '';
+  container.classList.remove('channel-icon'); // defensive: this container may have last shown a channel icon
   if (avatar && avatar.type === 'preset' && presetsById[avatar.value]) {
     const p = presetsById[avatar.value];
     container.style.background = 'var(--panel-raised)';
@@ -379,32 +422,39 @@ els['lightbox-modal'] && els['lightbox-modal'].addEventListener('click', (e) => 
 // ---------------------------------------------------------------------
 // composer attachment picker
 // ---------------------------------------------------------------------
+function updateSendButtonState() {
+  const hasText = els['composer-input'].value.trim().length > 0;
+  const hasFiles = pendingFiles.length > 0;
+  els['composer-send'].classList.toggle('active', hasText || hasFiles);
+}
+
 function renderAttachmentPreviewStrip() {
   const container = els['attachment-preview'];
   container.innerHTML = '';
   if (pendingFiles.length === 0) {
     container.classList.add('hidden');
-    return;
-  }
-  container.classList.remove('hidden');
-  pendingFiles.forEach((file, idx) => {
-    const chip = document.createElement('div');
-    chip.className = 'attachment-preview-chip';
-    const label = document.createElement('span');
-    label.textContent = `${file.name} (${formatFileSize(file.size)})`;
-    const removeBtn = document.createElement('button');
-    removeBtn.type = 'button';
-    removeBtn.className = 'icon-btn';
-    removeBtn.title = 'Remove';
-    removeBtn.textContent = '✕';
-    removeBtn.addEventListener('click', () => {
-      pendingFiles.splice(idx, 1);
-      renderAttachmentPreviewStrip();
+  } else {
+    container.classList.remove('hidden');
+    pendingFiles.forEach((file, idx) => {
+      const chip = document.createElement('div');
+      chip.className = 'attachment-preview-chip';
+      const label = document.createElement('span');
+      label.textContent = `${file.name} (${formatFileSize(file.size)})`;
+      const removeBtn = document.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.className = 'icon-btn';
+      removeBtn.title = 'Remove';
+      removeBtn.textContent = '✕';
+      removeBtn.addEventListener('click', () => {
+        pendingFiles.splice(idx, 1);
+        renderAttachmentPreviewStrip();
+      });
+      chip.appendChild(label);
+      chip.appendChild(removeBtn);
+      container.appendChild(chip);
     });
-    chip.appendChild(label);
-    chip.appendChild(removeBtn);
-    container.appendChild(chip);
-  });
+  }
+  updateSendButtonState();
 }
 function clearPendingFiles() {
   pendingFiles = [];
@@ -524,7 +574,8 @@ function sendReaction(channelId, messageId, emoji) {
   if (!socket || socket.readyState !== 1) return;
   socket.send(JSON.stringify({ type: 'room_react', channelId, messageId, emoji }));
 }
-function openReactionPicker(anchorEl, channelId, messageId) {
+async function openReactionPicker(anchorEl, channelId, messageId) {
+  await ensureEmojiPicker(); // no-op after the first call — see PERFORMANCE NOTE at top of file
   reactionPickerCtx = { channelId, messageId };
   const picker = els['reaction-picker'];
   const margin = 10;
@@ -576,15 +627,30 @@ emojiPickerEl && emojiPickerEl.addEventListener('emoji-click', (e) => {
 });
 
 // ---------------------------------------------------------------------
-// message rendering (Telegram-style bubble: avatar, author, text,
-// attachments, reaction pills, hover-to-react)
+// message rendering (Telegram/Instagram-style bubble: avatar, author,
+// text, attachments, reaction pills, hover-to-react, and consecutive
+// messages from the same sender grouped together with the repeat
+// avatar/name hidden)
 // ---------------------------------------------------------------------
+function shouldGroupWithPrevious(fromId, ts) {
+  const container = els['messages'];
+  const last = container.lastElementChild;
+  if (!last || !last.classList || !last.classList.contains('message')) return false;
+  if (last.dataset.from !== fromId) return false;
+  const lastTs = Number(last.dataset.ts || 0);
+  const curTs = Number(ts || Date.now());
+  return Math.abs(curTs - lastTs) < GROUP_WINDOW_MS;
+}
+
 function renderMessage(msg, kind, scopeId, isChannel) {
   const tpl = document.getElementById('message-template');
   const node = tpl.content.firstElementChild.cloneNode(true);
   node.dataset.messageId = msg.id;
   node.dataset.from = msg.from;
   node.classList.add(kind);
+
+  if (shouldGroupWithPrevious(msg.from, msg.ts)) node.classList.add('grouped');
+  node.dataset.ts = String(msg.ts || Date.now());
 
   const avatarEl = node.querySelector('.message-avatar');
   const authorEl = node.querySelector('.message-author');
@@ -593,6 +659,7 @@ function renderMessage(msg, kind, scopeId, isChannel) {
   const attachmentsEl = node.querySelector('.message-attachments');
   const reactionsEl = node.querySelector('.message-reactions');
   const reactBtn = node.querySelector('.message-react-btn');
+  const heartBtn = node.querySelector('.message-heart-btn');
 
   if (kind === 'mine') {
     renderAvatar(avatarEl, session.user.id, session.user.avatar, session.user.displayName);
@@ -618,9 +685,16 @@ function renderMessage(msg, kind, scopeId, isChannel) {
       e.stopPropagation();
       openReactionPicker(reactBtn, scopeId, msg.id);
     });
+    heartBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      sendReaction(scopeId, msg.id, '❤️');
+    });
+    // Double-tap/double-click a bubble to heart it, same gesture as Instagram DMs.
+    node.querySelector('.message-bubble').addEventListener('dblclick', () => sendReaction(scopeId, msg.id, '❤️'));
   } else {
     reactionsEl.classList.add('hidden');
     reactBtn.remove(); // no DM reaction path in the current backend
+    heartBtn.remove();
   }
 
   els['messages'].appendChild(node);
@@ -689,8 +763,7 @@ function renderChannels() {
     const btn = document.createElement('button');
     btn.className = 'roster-item' + (ch.id === selectedChannelId ? ' active' : '');
     const icon = document.createElement('div');
-    icon.className = 'avatar avatar-sm';
-    icon.style.background = 'var(--panel-raised)';
+    icon.className = 'avatar avatar-sm channel-icon';
     icon.textContent = channelIcon(ch.type);
     const name = document.createElement('span');
     name.className = 'roster-name';
@@ -725,7 +798,8 @@ async function selectChannel(channelId) {
   els['chat-empty'].classList.add('hidden');
   els['chat-active'].classList.remove('hidden');
   els['peer-avatar'].innerHTML = '';
-  els['peer-avatar'].style.background = 'var(--panel-raised)';
+  els['peer-avatar'].classList.add('channel-icon');
+  els['peer-avatar'].style.background = '';
   els['peer-avatar'].textContent = channelIcon(ch ? ch.type : 'group');
   els['peer-name'].textContent = ch ? ch.name : channelId;
   setStatus(socket && socket.readyState === 1 ? 'secured' : '', socket && socket.readyState === 1 ? 'Connected' : 'Connecting…');
@@ -971,6 +1045,7 @@ async function appendHistory(peerId, entry) {
 }
 
 async function initClient() {
+  await loadScriptOnce('sdk/e2ee-sdk.bundle.js'); // see PERFORMANCE NOTE at top of file
   await window.E2EE.crypto.ready();
   const storageKey = `client:${session.user.id}`;
   const saved = await idbGet(storageKey);
@@ -1123,6 +1198,7 @@ async function sendCurrentMessage() {
 
   els['composer-input'].value = '';
   clearPendingFiles();
+  updateSendButtonState();
   els['composer-send'].disabled = true;
   els['composer-error'].textContent = '';
   try {
@@ -1459,6 +1535,10 @@ function showApp() {
     els['leader-badge'].classList.remove('hidden');
     els['admin-link'].classList.remove('hidden');
   }
+  // Quietly prefetch the emoji picker now that we're past the login
+  // screen, so it's already warm the first time someone opens a
+  // reaction picker instead of them waiting on it mid-interaction.
+  ensureEmojiPicker().catch(() => {});
 }
 
 async function boot() {
@@ -1540,6 +1620,7 @@ els['composer-input'].addEventListener('keydown', (e) => {
     sendCurrentMessage();
   }
 });
+els['composer-input'].addEventListener('input', updateSendButtonState);
 
 // ---- logout ----
 els['logout-btn'].addEventListener('click', () => {
