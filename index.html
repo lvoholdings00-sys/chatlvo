@@ -49,6 +49,27 @@
   </div>
 </div>
 
+<!-- ---------------- Restore or start fresh (missing local E2EE state) ---------------- -->
+<div class="modal-backdrop hidden" id="restore-modal">
+  <div class="modal">
+    <h2>Restore secure-line history</h2>
+    <p class="subhead">This device is missing your encrypted conversation history. Enter your password to restore it from your account backup.</p>
+    <div class="field">
+      <label for="restore-password">Password</label>
+      <input id="restore-password" type="password" autocomplete="current-password" />
+    </div>
+    <p class="error-text" id="restore-error"></p>
+    <div class="modal-actions">
+      <button class="btn" id="restore-submit" style="width:auto;">Restore</button>
+    </div>
+    <hr class="modal-divider" />
+    <p class="hint-text">Don't have your password? Starting fresh means you won't be able to read old conversations here, and contacts will need to re-establish a secure session with you.</p>
+    <div class="modal-actions">
+      <button class="btn btn-danger" id="restore-skip" style="width:auto;">Start a new identity instead</button>
+    </div>
+  </div>
+</div>
+
 <!-- ---------------- App ---------------- -->
 <section id="app-screen" class="hidden">
   <aside class="rail" id="rail">
