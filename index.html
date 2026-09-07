@@ -4,15 +4,18 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>LVO — secure line</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="app.css" />
 <link rel="icon" type="image/png" href="assets/logo.png"/>
 <link rel="apple-touch-icon" href="assets/logo.png"/>
-<script type="module" src="https://cdn.jsdelivr.net/npm/emoji-picker-element@%5E1/index.js"></script>
 </head>
 <body>
 
 <!-- ---------------- Login ---------------- -->
 <section id="login-screen">
+  <a class="back-to-site login-back" href="https://online.lvo-cloud.cloud">← Back to lvo-cloud.cloud</a>
   <form class="login-card" id="login-form">
     <p class="wordmark">LVO</p>
     <p class="tagline">Secure line. Members only — accounts are created by the admin.</p>
@@ -105,10 +108,14 @@
           accept=".pdf,.txt,.png,.jpg,.jpeg,.gif,.webp,.heic,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm,.avi,.mkv"
           multiple
         />
-        <button class="icon-btn" type="button" id="composer-attach-btn" title="Attach a file">📎</button>
-        <button class="icon-btn" type="button" id="composer-gif-btn" title="Send a GIF">GIF</button>
-        <textarea id="composer-input" placeholder="Type a message…"></textarea>
-        <button class="btn" id="composer-send">Send</button>
+        <div class="composer-pill">
+          <button class="icon-btn" type="button" id="composer-attach-btn" title="Attach a file">📎</button>
+          <button class="icon-btn" type="button" id="composer-gif-btn" title="Send a GIF">GIF</button>
+          <textarea id="composer-input" placeholder="Message…"></textarea>
+        </div>
+        <button class="composer-send-btn" id="composer-send" title="Send">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M3 20l18-8L3 4v6l12 2-12 2z"/></svg>
+        </button>
       </div>
       <div class="composer-locked hidden" id="composer-locked">Only admins can post in this channel.</div>
     </div>
@@ -246,6 +253,11 @@
       <div class="message-reactions hidden"></div>
     </div>
     <div class="message-hover-actions">
+      <button class="icon-btn message-heart-btn" type="button" title="React with ❤️">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 20.5s-7.5-4.6-9.9-9.1C.6 8 2 4.6 5.3 3.9c2-.45 3.9.4 5 2 .8 1.15.9 1.15 1.7 0 1.1-1.6 3-2.45 5-2 3.3.7 4.7 4.1 3.2 7.5-2.4 4.5-9.9 9.1-9.9 9.1z"/>
+        </svg>
+      </button>
       <button class="icon-btn message-react-btn" type="button" title="Add reaction">
         <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
           <circle cx="8" cy="8" r="6.3"/>
@@ -269,7 +281,8 @@
 
 <!-- ---------------- Reaction picker popup (positioned near the message that was hovered/tapped) ----------------
      Full emoji set via the emoji-picker-element web component instead of
-     a hardcoded row of 6 buttons. -->
+     a hardcoded row of 6 buttons. The custom element script is lazy-loaded
+     by app.js the first time this popup is opened, not on initial page load. -->
 <div class="reaction-picker hidden" id="reaction-picker">
   <emoji-picker id="emoji-picker-el"></emoji-picker>
 </div>
@@ -317,7 +330,13 @@
   </div>
 </div>
 
-<script src="sdk/e2ee-sdk.bundle.js"></script>
+<!--
+  sdk/e2ee-sdk.bundle.js and the emoji-picker-element module are NOT
+  loaded here anymore. Both are lazy-loaded from app.js only when
+  actually needed (after a successful login, and the first time the
+  reaction picker opens) so the login screen doesn't have to download
+  the crypto bundle before it's even interactive.
+-->
 <script src="app.js"></script>
 </body>
 </html>
