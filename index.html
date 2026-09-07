@@ -7,6 +7,7 @@
 <link rel="stylesheet" href="app.css" />
 <link rel="icon" type="image/png" href="assets/logo.png"/>
 <link rel="apple-touch-icon" href="assets/logo.png"/>
+<script type="module" src="https://cdn.jsdelivr.net/npm/emoji-picker-element@%5E1/index.js"></script>
 </head>
 <body>
 
@@ -99,6 +100,7 @@
           multiple
         />
         <button class="icon-btn" type="button" id="composer-attach-btn" title="Attach a file">📎</button>
+        <button class="icon-btn" type="button" id="composer-gif-btn" title="Send a GIF">GIF</button>
         <textarea id="composer-input" placeholder="Type a message…"></textarea>
         <button class="btn" id="composer-send">Send</button>
       </div>
@@ -251,14 +253,11 @@
   </button>
 </template>
 
-<!-- ---------------- Reaction picker popup (positioned near the message that was hovered/tapped) ---------------- -->
+<!-- ---------------- Reaction picker popup (positioned near the message that was hovered/tapped) ----------------
+     Full emoji set via the emoji-picker-element web component instead of
+     a hardcoded row of 6 buttons. -->
 <div class="reaction-picker hidden" id="reaction-picker">
-  <button class="reaction-picker-emoji" type="button" data-emoji="👍">👍</button>
-  <button class="reaction-picker-emoji" type="button" data-emoji="❤️">❤️</button>
-  <button class="reaction-picker-emoji" type="button" data-emoji="😂">😂</button>
-  <button class="reaction-picker-emoji" type="button" data-emoji="😮">😮</button>
-  <button class="reaction-picker-emoji" type="button" data-emoji="😢">😢</button>
-  <button class="reaction-picker-emoji" type="button" data-emoji="🙏">🙏</button>
+  <emoji-picker id="emoji-picker-el"></emoji-picker>
 </div>
 
 <!-- ---------------- Attachment bubble template (cloned by app.js per message) ---------------- -->
@@ -286,6 +285,21 @@
     <button class="icon-btn lightbox-close" id="lightbox-close" title="Close">✕</button>
     <img class="lightbox-image hidden" id="lightbox-image" alt="" />
     <video class="lightbox-video hidden" id="lightbox-video" controls></video>
+  </div>
+</div>
+
+<!-- ---------------- GIF search modal (GIPHY) ---------------- -->
+<div class="modal-backdrop hidden" id="gif-modal">
+  <div class="modal gif-modal">
+    <h2>Send a GIF</h2>
+    <div class="field">
+      <input id="gif-search-input" type="text" placeholder="Search GIPHY…" />
+    </div>
+    <div class="gif-grid" id="gif-grid"></div>
+    <p class="error-text" id="gif-error"></p>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" id="gif-cancel" style="width:auto;">Close</button>
+    </div>
   </div>
 </div>
 
