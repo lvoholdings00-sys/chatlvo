@@ -38,6 +38,16 @@
  * initClient(), which only runs after a successful login), and the
  * emoji picker is prefetched quietly in the background right after
  * login so it's warm by the time someone opens the reaction picker.
+ *
+ * E2EE IDENTITY RECOVERY (see initClient / promptForRestoreOrFreshStart
+ * below): if this device has no local E2EE state, we NEVER silently
+ * generate a brand-new identity when a server-side backup exists for
+ * this account. Doing so used to happen implicitly whenever a native
+ * prompt() for the restore password was dismissed/cancelled, which
+ * quietly overwrote the account's published key bundle and broke every
+ * existing session other people had with this account. Generating a
+ * fresh identity now requires an explicit, confirmed choice through a
+ * real modal (#restore-modal) — see promptForRestoreOrFreshStart().
  */
 
 
@@ -169,6 +179,7 @@ const els = {};
 [
   'login-screen', 'login-form', 'login-username', 'login-password', 'login-submit', 'login-error',
   'pwd-modal', 'pwd-new', 'pwd-error', 'pwd-save',
+  'restore-modal', 'restore-password', 'restore-error', 'restore-submit', 'restore-skip',
   'app-screen', 'rail', 'chat-pane', 'me-avatar', 'me-name', 'leader-badge', 'open-avatar-modal',
   'channels-list', 'roster-list', 'admin-link', 'logout-btn',
   'settings-btn', 'settings-popover', 'settings-avatar-btn',
@@ -216,7 +227,8 @@ els['chat-back-btn'] && els['chat-back-btn'].addEventListener('click', closeChat
 //     their password in this tab (fresh login, or the forced first-time
 //     password change). A reloaded tab with a persisted session token
 //     but no local IndexedDB state has to ask for the password once to
-//     attempt a restore (see the prompt() fallback in initClient below).
+//     attempt a restore (see promptForRestoreOrFreshStart / initClient
+//     below).
 //   - If the password changes, the old backup is invalidated server-side
 //     (see handleAdminResetPassword) since it was encrypted with a key
 //     derived from the old password. The next device that pushes a
@@ -312,6 +324,75 @@ async function tryRestoreFromServerBackup(password) {
     console.error('Backup restore failed — wrong password derivation, or the backup predates a password change', e);
     return false;
   }
+}
+
+// ---------------------------------------------------------------------
+// restore-or-fresh-start modal (see E2EE IDENTITY RECOVERY note at top
+// of file). Blocks until the person either successfully restores from
+// their server backup, or explicitly confirms starting a brand-new
+// identity on this device. There is no silent fallthrough — every path
+// out of this function is a deliberate, confirmed choice.
+// ---------------------------------------------------------------------
+function promptForRestoreOrFreshStart() {
+  return new Promise((resolve) => {
+    const modal = els['restore-modal'];
+    const pwInput = els['restore-password'];
+    const errorEl = els['restore-error'];
+    const submitBtn = els['restore-submit'];
+    const skipBtn = els['restore-skip'];
+
+    errorEl.textContent = '';
+    pwInput.value = '';
+    modal.classList.remove('hidden');
+    pwInput.focus();
+
+    function cleanup() {
+      modal.classList.add('hidden');
+      submitBtn.removeEventListener('click', onSubmit);
+      skipBtn.removeEventListener('click', onSkip);
+      pwInput.removeEventListener('keydown', onKeydown);
+    }
+
+    async function onSubmit() {
+      const pw = pwInput.value;
+      if (!pw) {
+        errorEl.textContent = 'Enter your password, or choose "Start a new identity instead" below.';
+        return;
+      }
+      submitBtn.disabled = true;
+      errorEl.textContent = '';
+      const restored = await tryRestoreFromServerBackup(pw);
+      submitBtn.disabled = false;
+      if (restored) {
+        sessionPassword = pw;
+        cleanup();
+        resolve({ startFresh: false });
+      } else {
+        errorEl.textContent = 'That password did not match your backup. This can also happen after a password reset — try again, or start fresh below.';
+        pwInput.value = '';
+        pwInput.focus();
+      }
+    }
+
+    function onSkip() {
+      if (!confirm('This will start a brand-new secure identity on this device. You will lose access to old conversations here, and contacts will need to re-establish a secure session with you. Continue?')) {
+        return;
+      }
+      cleanup();
+      resolve({ startFresh: true });
+    }
+
+    function onKeydown(e) {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        onSubmit();
+      }
+    }
+
+    submitBtn.addEventListener('click', onSubmit);
+    skipBtn.addEventListener('click', onSkip);
+    pwInput.addEventListener('keydown', onKeydown);
+  });
 }
 
 // ---------------------------------------------------------------------
@@ -1187,31 +1268,44 @@ async function initClient() {
   await window.E2EE.crypto.ready();
   const storageKey = `client:${session.user.id}`;
   let saved = await idbGet(storageKey);
+
   if (!saved) {
-    // No local identity on this device yet. Before generating a brand new
-    // one (which would leave this device unable to read any existing DM
-    // history/sessions), see if there's a cross-device backup to restore.
-    let pw = sessionPassword;
-    if (!pw) {
-      // We got here via a persisted session token rather than a fresh
-      // login (e.g. this device's IndexedDB was cleared but localStorage
-      // wasn't) — no password in memory. Only bother asking for one if a
-      // backup actually exists; otherwise this is genuinely a first-ever
-      // device and there's nothing to restore.
-      try {
-        await api('/me/backup', { token: session.token });
-        pw = prompt('This device has no local secure-line history yet. Enter your password to restore it from your account backup:') || null;
-      } catch {
-        pw = null;
+    // No local identity on this device yet. Before ever generating a
+    // brand new one (which would leave this device unable to read any
+    // existing DM history/sessions, AND would overwrite the published
+    // key bundle other people's sessions rely on), find out whether a
+    // cross-device backup exists — and if it does, this is NOT a decision
+    // we make silently. See the E2EE IDENTITY RECOVERY note at the top
+    // of this file.
+    let backupExists = false;
+    try {
+      await api('/me/backup', { token: session.token });
+      backupExists = true;
+    } catch {
+      backupExists = false; // genuinely a first-ever device — nothing to restore
+    }
+
+    if (backupExists) {
+      if (sessionPassword) {
+        // We arrived here via a fresh login or the forced first-time
+        // password change, so the real password is already in memory —
+        // restore silently, no need to interrupt with a modal.
+        const restored = await tryRestoreFromServerBackup(sessionPassword);
+        if (restored) saved = await idbGet(storageKey);
+        // If this fails (e.g. a stale backup from before a password
+        // reset), fall through to the modal below instead of silently
+        // generating a new identity.
+      }
+      if (!saved) {
+        const { startFresh } = await promptForRestoreOrFreshStart();
+        if (!startFresh) saved = await idbGet(storageKey);
+        // startFresh === true is now the ONLY way to reach client.init()
+        // below with no saved state, and it requires two explicit,
+        // confirmed choices — never a dismissed native prompt().
       }
     }
-    if (pw) {
-      const restored = await tryRestoreFromServerBackup(pw);
-      if (restored) {
-        sessionPassword = pw;
-        saved = await idbGet(storageKey);
-      }
-    }
+    // backupExists === false: this really is a first-ever device for this
+    // account. Proceed to client.init() below, unchanged from before.
   }
 
   const transportBundle = window.E2EE.createBrowserTransport({
@@ -1290,7 +1384,7 @@ async function initClient() {
   if (saved) {
     await client.restore(saved);
   } else {
-    await client.init();
+    await client.init(); // reached only for a true first device, or an explicit "start fresh" choice
   }
   await idbSet(storageKey, client.export());
   scheduleBackupPush(); // make sure a backup exists even before the first message is sent/received
