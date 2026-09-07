@@ -71,8 +71,8 @@ function clearSession() {
   localStorage.removeItem(SESSION_KEY);
 }
 
-async function api(path, { method = 'GET', body, token, rawBody, contentType } = {}) {
-  const headers = {};
+async function api(path, { method = 'GET', body, token, rawBody, contentType, headers: extraHeaders } = {}) {
+  const headers = { ...(extraHeaders || {}) };
   if (token) headers.Authorization = `Bearer ${token}`;
   let fetchBody;
   if (rawBody !== undefined) {
@@ -102,6 +102,13 @@ let socket = null;
 const avatarBlobCache = new Map(); // userId -> object URL
 const channelTypeById = {}; // scratch used while building the create-channel modal
 
+// Files + reactions state.
+const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // must match the Worker's limits
+let pendingFiles = []; // File[] queued in the composer, not yet sent
+let channelMessageEls = {}; // messageId -> { el, reactions } for the currently-open channel only
+let reactionPickerCtx = null; // { channelId, messageId } the picker popup is currently anchored to
+const fileBlobCache = new Map(); // storageKey -> object URL, for plaintext channel attachments
+
 const els = {};
 [
   'login-screen', 'login-form', 'login-username', 'login-password', 'login-submit', 'login-error',
@@ -110,6 +117,8 @@ const els = {};
   'channels-list', 'roster-list', 'admin-link', 'logout-btn',
   'chat-empty', 'chat-active', 'peer-avatar', 'peer-name', 'status-dot', 'status-text',
   'messages', 'composer-input', 'composer-send', 'composer-row', 'composer-error', 'composer-locked',
+  'composer-file-input', 'composer-attach-btn', 'attachment-preview',
+  'reaction-picker', 'lightbox-modal', 'lightbox-image', 'lightbox-video', 'lightbox-close',
   'avatar-modal', 'preset-grid', 'upload-preview', 'upload-input', 'avatar-error', 'avatar-cancel',
   'tab-presets', 'tab-upload',
   'channel-modal', 'channel-name', 'channel-member-picker', 'channel-error', 'channel-cancel', 'channel-create',
@@ -167,6 +176,348 @@ function renderAvatar(container, userId, avatar, displayName) {
   }
   container.style.background = 'var(--panel-raised)';
   container.textContent = (displayName || '?').trim().slice(0, 1).toUpperCase();
+}
+
+// ---------------------------------------------------------------------
+// files: upload, encryption (DM only), fetching, and rendering
+// ---------------------------------------------------------------------
+function formatFileSize(bytes) {
+  if (!bytes && bytes !== 0) return '';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+function fileKindFromMime(mime) {
+  if (!mime) return 'file';
+  if (mime.startsWith('image/')) return 'image';
+  if (mime.startsWith('audio/')) return 'audio';
+  if (mime.startsWith('video/')) return 'video';
+  return 'file';
+}
+
+// Channel attachments are plaintext on the server, same trust tier as
+// channel text — fetch them the same way avatars are fetched (bearer
+// token on the request, cached as a local object URL).
+async function getChannelFileBlobUrl(storageKey) {
+  if (fileBlobCache.has(storageKey)) return fileBlobCache.get(storageKey);
+  const res = await fetch(`${SERVER_URL}/files/${encodeURIComponent(storageKey)}`, {
+    headers: { Authorization: `Bearer ${session.token}` },
+  });
+  if (!res.ok) throw new Error('Could not load attachment.');
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  fileBlobCache.set(storageKey, url);
+  return url;
+}
+
+// DM attachments follow the same trust model as DM text: the Worker only
+// ever sees ciphertext. We encrypt the file locally with a random
+// per-file AES-GCM key before upload, then deliver that key to the
+// recipient inside a normal E2EE ratchet message (as a JSON "descriptor"
+// sent through client.sendMessage), exactly like the Worker comments
+// describe. This uses WebCrypto directly rather than the E2EE SDK, since
+// this is a separate, simpler symmetric-encryption step, not part of the
+// X3DH/ratchet session itself.
+async function encryptBufferForDm(buffer) {
+  const rawKey = crypto.getRandomValues(new Uint8Array(32));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const cryptoKey = await crypto.subtle.importKey('raw', rawKey, 'AES-GCM', false, ['encrypt']);
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, cryptoKey, buffer);
+  return {
+    ciphertext,
+    rawKeyB64: btoa(String.fromCharCode(...rawKey)),
+    ivB64: btoa(String.fromCharCode(...iv)),
+  };
+}
+async function decryptDmFileBuffer(ciphertextBuffer, rawKeyB64, ivB64) {
+  const rawKey = Uint8Array.from(atob(rawKeyB64), (c) => c.charCodeAt(0));
+  const iv = Uint8Array.from(atob(ivB64), (c) => c.charCodeAt(0));
+  const cryptoKey = await crypto.subtle.importKey('raw', rawKey, 'AES-GCM', false, ['decrypt']);
+  return crypto.subtle.decrypt({ name: 'AES-GCM', iv }, cryptoKey, ciphertextBuffer);
+}
+function isAttachmentDescriptor(text) {
+  if (!text || text[0] !== '{') return null;
+  try {
+    const obj = JSON.parse(text);
+    return obj && obj.__lvoAttachment ? obj : null;
+  } catch {
+    return null;
+  }
+}
+
+async function uploadChannelFile(channelId, file) {
+  const buf = await file.arrayBuffer();
+  return api(`/channels/${encodeURIComponent(channelId)}/upload`, {
+    method: 'POST',
+    token: session.token,
+    rawBody: buf,
+    contentType: file.type || 'application/octet-stream',
+    headers: { 'X-Filename': encodeURIComponent(file.name) },
+  });
+}
+async function uploadDmFile(peerId, file) {
+  const buf = await file.arrayBuffer();
+  const { ciphertext, rawKeyB64, ivB64 } = await encryptBufferForDm(buf);
+  const data = await api('/dm-files/upload', {
+    method: 'POST',
+    token: session.token,
+    rawBody: ciphertext,
+    headers: { 'X-To': peerId },
+  });
+  return {
+    storageKey: data.key,
+    size: data.size,
+    filename: file.name,
+    mime: file.type || 'application/octet-stream',
+    rawKeyB64,
+    ivB64,
+  };
+}
+
+// Resolves an attachment descriptor to a displayable/downloadable blob URL.
+// `attachment.localUrl` is used for a file the current user just sent
+// (we already have the plaintext bytes, no need to round-trip the server).
+async function resolveAttachmentUrl(attachment, isChannel) {
+  if (attachment.localUrl) return attachment.localUrl;
+  if (isChannel) return getChannelFileBlobUrl(attachment.key);
+  const res = await fetch(`${SERVER_URL}/files/${encodeURIComponent(attachment.storageKey)}`, {
+    headers: { Authorization: `Bearer ${session.token}` },
+  });
+  if (!res.ok) throw new Error('Could not load attachment.');
+  const ciphertext = await res.arrayBuffer();
+  const plaintext = await decryptDmFileBuffer(ciphertext, attachment.cryptoKey, attachment.iv);
+  const blob = new Blob([plaintext], { type: attachment.mime || 'application/octet-stream' });
+  return URL.createObjectURL(blob);
+}
+
+function renderAttachmentInto(container, attachment, isChannel) {
+  const tpl = document.getElementById('attachment-bubble-template');
+  const node = tpl.content.firstElementChild.cloneNode(true);
+  const kind = fileKindFromMime(attachment.mime);
+  node.dataset.kind = kind;
+
+  const imageLink = node.querySelector('.attachment-image-link');
+  const imageEl = node.querySelector('.attachment-image');
+  const fileBox = node.querySelector('.attachment-file');
+  const fileIcon = node.querySelector('.attachment-file-icon');
+  const fileNameEl = node.querySelector('.attachment-file-name');
+  const fileSizeEl = node.querySelector('.attachment-file-size');
+  const downloadLink = node.querySelector('.attachment-download-link');
+  const audioEl = node.querySelector('.attachment-audio');
+  const videoEl = node.querySelector('.attachment-video');
+
+  fileNameEl.textContent = attachment.filename || 'file';
+  fileSizeEl.textContent = formatFileSize(attachment.size);
+  fileIcon.textContent = kind === 'audio' ? '🎵' : kind === 'video' ? '🎬' : kind === 'image' ? '🖼️' : '📄';
+  fileBox.classList.remove('hidden'); // shown as the fallback / loading state
+  container.appendChild(node);
+
+  resolveAttachmentUrl(attachment, isChannel)
+    .then((url) => {
+      downloadLink.href = url;
+      downloadLink.setAttribute('download', attachment.filename || 'file');
+      if (kind === 'image') {
+        imageEl.src = url;
+        imageEl.alt = attachment.filename || '';
+        imageEl.classList.remove('hidden');
+        fileBox.classList.add('hidden');
+        imageLink.addEventListener('click', (e) => {
+          e.preventDefault();
+          openLightbox('image', url);
+        });
+      } else if (kind === 'audio') {
+        audioEl.src = url;
+        audioEl.classList.remove('hidden');
+        fileBox.classList.add('hidden');
+      } else if (kind === 'video') {
+        videoEl.src = url;
+        videoEl.classList.remove('hidden');
+        fileBox.classList.add('hidden');
+        videoEl.addEventListener('click', () => openLightbox('video', url));
+      }
+      // 'file' kind keeps the fallback file-chip visible with a working download link.
+    })
+    .catch((err) => {
+      fileNameEl.textContent = `${attachment.filename || 'file'} (failed to load: ${err.message})`;
+    });
+}
+
+function openLightbox(kind, url) {
+  els['lightbox-image'].classList.add('hidden');
+  els['lightbox-video'].classList.add('hidden');
+  els['lightbox-video'].pause();
+  if (kind === 'image') {
+    els['lightbox-image'].src = url;
+    els['lightbox-image'].classList.remove('hidden');
+  } else {
+    els['lightbox-video'].src = url;
+    els['lightbox-video'].classList.remove('hidden');
+  }
+  els['lightbox-modal'].classList.remove('hidden');
+}
+function closeLightbox() {
+  els['lightbox-modal'].classList.add('hidden');
+  els['lightbox-video'].pause();
+  els['lightbox-video'].removeAttribute('src');
+  els['lightbox-image'].removeAttribute('src');
+}
+els['lightbox-close'] && els['lightbox-close'].addEventListener('click', closeLightbox);
+els['lightbox-modal'] && els['lightbox-modal'].addEventListener('click', (e) => {
+  if (e.target === els['lightbox-modal']) closeLightbox();
+});
+
+// ---------------------------------------------------------------------
+// composer attachment picker
+// ---------------------------------------------------------------------
+function renderAttachmentPreviewStrip() {
+  const container = els['attachment-preview'];
+  container.innerHTML = '';
+  if (pendingFiles.length === 0) {
+    container.classList.add('hidden');
+    return;
+  }
+  container.classList.remove('hidden');
+  pendingFiles.forEach((file, idx) => {
+    const chip = document.createElement('div');
+    chip.className = 'attachment-preview-chip';
+    const label = document.createElement('span');
+    label.textContent = `${file.name} (${formatFileSize(file.size)})`;
+    const removeBtn = document.createElement('button');
+    removeBtn.type = 'button';
+    removeBtn.className = 'icon-btn';
+    removeBtn.title = 'Remove';
+    removeBtn.textContent = '✕';
+    removeBtn.addEventListener('click', () => {
+      pendingFiles.splice(idx, 1);
+      renderAttachmentPreviewStrip();
+    });
+    chip.appendChild(label);
+    chip.appendChild(removeBtn);
+    container.appendChild(chip);
+  });
+}
+function clearPendingFiles() {
+  pendingFiles = [];
+  renderAttachmentPreviewStrip();
+  if (els['composer-file-input']) els['composer-file-input'].value = '';
+}
+els['composer-attach-btn'] && els['composer-attach-btn'].addEventListener('click', () => {
+  els['composer-file-input'].click();
+});
+els['composer-file-input'] && els['composer-file-input'].addEventListener('change', (e) => {
+  const files = Array.from(e.target.files || []);
+  const tooBig = files.find((f) => f.size > MAX_ATTACHMENT_BYTES);
+  if (tooBig) {
+    els['composer-error'].textContent = `${tooBig.name} is over the 20MB limit.`;
+  }
+  pendingFiles = pendingFiles.concat(files.filter((f) => f.size <= MAX_ATTACHMENT_BYTES));
+  renderAttachmentPreviewStrip();
+});
+
+// ---------------------------------------------------------------------
+// reactions (channels only — the current backend has no DM reaction path)
+// ---------------------------------------------------------------------
+function renderReactionsInto(container, reactions, channelId, messageId) {
+  container.innerHTML = '';
+  const emojis = Object.keys(reactions || {}).filter((e) => reactions[e] && reactions[e].length > 0);
+  container.classList.toggle('hidden', emojis.length === 0);
+  for (const emoji of emojis) {
+    const users = reactions[emoji];
+    const tpl = document.getElementById('reaction-pill-template');
+    const pill = tpl.content.firstElementChild.cloneNode(true);
+    pill.dataset.emoji = emoji;
+    pill.querySelector('.reaction-emoji').textContent = emoji;
+    pill.querySelector('.reaction-count').textContent = String(users.length);
+    if (users.includes(session.user.id)) pill.classList.add('mine-reaction');
+    pill.addEventListener('click', () => sendReaction(channelId, messageId, emoji));
+    container.appendChild(pill);
+  }
+}
+function sendReaction(channelId, messageId, emoji) {
+  if (!socket || socket.readyState !== 1) return;
+  socket.send(JSON.stringify({ type: 'room_react', channelId, messageId, emoji }));
+}
+function openReactionPicker(anchorEl, channelId, messageId) {
+  reactionPickerCtx = { channelId, messageId };
+  const rect = anchorEl.getBoundingClientRect();
+  const picker = els['reaction-picker'];
+  picker.style.position = 'fixed';
+  picker.style.top = `${rect.bottom + 6}px`;
+  picker.style.left = `${Math.max(8, rect.left - 100)}px`;
+  picker.classList.remove('hidden');
+}
+function closeReactionPicker() {
+  reactionPickerCtx = null;
+  els['reaction-picker'] && els['reaction-picker'].classList.add('hidden');
+}
+document.addEventListener('click', (e) => {
+  const picker = els['reaction-picker'];
+  if (!picker || picker.classList.contains('hidden')) return;
+  if (!picker.contains(e.target) && !e.target.closest('.message-react-btn')) closeReactionPicker();
+});
+els['reaction-picker'] && els['reaction-picker'].querySelectorAll('.reaction-picker-emoji').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    if (reactionPickerCtx) sendReaction(reactionPickerCtx.channelId, reactionPickerCtx.messageId, btn.dataset.emoji);
+    closeReactionPicker();
+  });
+});
+
+// ---------------------------------------------------------------------
+// message rendering (Telegram-style bubble: avatar, author, text,
+// attachments, reaction pills, hover-to-react)
+// ---------------------------------------------------------------------
+function renderMessage(msg, kind, scopeId, isChannel) {
+  const tpl = document.getElementById('message-template');
+  const node = tpl.content.firstElementChild.cloneNode(true);
+  node.dataset.messageId = msg.id;
+  node.dataset.from = msg.from;
+  node.classList.add(kind);
+
+  const avatarEl = node.querySelector('.message-avatar');
+  const authorEl = node.querySelector('.message-author');
+  const timeEl = node.querySelector('.message-time');
+  const textEl = node.querySelector('.message-text');
+  const attachmentsEl = node.querySelector('.message-attachments');
+  const reactionsEl = node.querySelector('.message-reactions');
+  const reactBtn = node.querySelector('.message-react-btn');
+
+  if (kind === 'mine') {
+    renderAvatar(avatarEl, session.user.id, session.user.avatar, session.user.displayName);
+    authorEl.textContent = 'You';
+  } else {
+    const member = roster.find((m) => m.id === msg.from);
+    renderAvatar(avatarEl, msg.from, member ? member.avatar : null, msg.fromName || (member && member.displayName));
+    authorEl.textContent = msg.fromName || (member && member.displayName) || msg.from;
+  }
+  timeEl.textContent = new Date(msg.ts || Date.now()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+  if (msg.text) {
+    textEl.textContent = msg.text;
+  } else {
+    textEl.classList.add('hidden');
+  }
+
+  if (msg.attachment) renderAttachmentInto(attachmentsEl, msg.attachment, isChannel);
+
+  if (isChannel) {
+    renderReactionsInto(reactionsEl, msg.reactions || {}, scopeId, msg.id);
+    reactBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openReactionPicker(reactBtn, scopeId, msg.id);
+    });
+  } else {
+    reactionsEl.classList.add('hidden');
+    reactBtn.remove(); // no DM reaction path in the current backend
+  }
+
+  els['messages'].appendChild(node);
+  els['messages'].scrollTop = els['messages'].scrollHeight;
+
+  if (isChannel) {
+    if (!channelMessageEls[scopeId]) channelMessageEls[scopeId] = new Map();
+    channelMessageEls[scopeId].set(msg.id, { el: node, reactions: msg.reactions || {} });
+  }
+  return node;
 }
 
 // ---------------------------------------------------------------------
@@ -252,6 +603,8 @@ async function loadChannelMessages(channelId) {
 async function selectChannel(channelId) {
   selectedChannelId = channelId;
   selectedPeerId = null;
+  channelMessageEls = {}; // only the currently-open channel's messages are tracked for live reaction updates
+  closeReactionPicker();
   renderRoster();
   renderChannels();
 
@@ -278,8 +631,7 @@ async function selectChannel(channelId) {
     addBubble(`No messages yet in ${ch ? ch.name : 'this channel'}.`, 'system');
   }
   for (const entry of history) {
-    const label = entry.fromName || entry.from;
-    addBubble(`${label}: ${entry.text}`, entry.from === session.user.id ? 'mine' : 'theirs');
+    renderMessage(entry, entry.from === session.user.id ? 'mine' : 'theirs', channelId, true);
   }
 }
 
@@ -301,9 +653,11 @@ function renderChannelBanner(ch) {
   els['chat-active'].prepend(banner);
 }
 
-function sendChannelMessage(channelId, text) {
+function sendChannelMessage(channelId, text, attachment) {
   if (!socket || socket.readyState !== 1) throw new Error('Not connected.');
-  socket.send(JSON.stringify({ type: 'room_send', channelId, text }));
+  const payload = { type: 'room_send', channelId, text };
+  if (attachment) payload.attachment = attachment;
+  socket.send(JSON.stringify(payload));
 }
 
 // ---------------------------------------------------------------------
@@ -537,7 +891,30 @@ async function initClient() {
     }
     if (payload.type === 'room_message') {
       if (selectedChannelId === payload.channelId) {
-        addBubble(`${payload.fromName || payload.from}: ${payload.text}`, payload.from === session.user.id ? 'mine' : 'theirs');
+        renderMessage(
+          { id: payload.id, from: payload.from, fromName: payload.fromName, text: payload.text, attachment: payload.attachment, reactions: {}, ts: payload.ts },
+          payload.from === session.user.id ? 'mine' : 'theirs',
+          payload.channelId,
+          true
+        );
+      }
+      return;
+    }
+    if (payload.type === 'room_reaction') {
+      const store = channelMessageEls[payload.channelId];
+      const entry = store && store.get(payload.messageId);
+      if (entry) {
+        const reactions = entry.reactions;
+        if (payload.action === 'add') {
+          if (!reactions[payload.emoji]) reactions[payload.emoji] = [];
+          if (!reactions[payload.emoji].includes(payload.from)) reactions[payload.emoji].push(payload.from);
+        } else {
+          if (reactions[payload.emoji]) {
+            reactions[payload.emoji] = reactions[payload.emoji].filter((u) => u !== payload.from);
+            if (reactions[payload.emoji].length === 0) delete reactions[payload.emoji];
+          }
+        }
+        renderReactionsInto(entry.el.querySelector('.message-reactions'), reactions, payload.channelId, payload.messageId);
       }
       return;
     }
@@ -551,8 +928,9 @@ async function initClient() {
 
   client = new window.E2EE.E2EEClient(session.user.id, transportBundle.transport);
   client.onMessage = async (from, text) => {
-    await appendHistory(from, { from, text, ts: Date.now() });
-    if (from === selectedPeerId) addBubble(text, 'theirs');
+    const ts = Date.now();
+    await appendHistory(from, { from, text, ts });
+    if (from === selectedPeerId) renderDmHistoryEntry({ from, text, ts });
     await idbSet(storageKey, client.export());
   };
 
@@ -564,9 +942,42 @@ async function initClient() {
   await idbSet(storageKey, client.export());
 }
 
+// A DM "message" from the wire is either plain chat text, or a JSON
+// attachment descriptor (see uploadDmFile / sendCurrentMessage) — this
+// tells the two apart and renders whichever it is.
+function renderDmHistoryEntry(entry) {
+  const kind = entry.from === session.user.id ? 'mine' : 'theirs';
+  const descriptor = isAttachmentDescriptor(entry.text);
+  if (descriptor) {
+    renderMessage(
+      {
+        id: `${entry.ts}-${entry.from}`,
+        from: entry.from,
+        text: '',
+        attachment: {
+          storageKey: descriptor.storageKey,
+          filename: descriptor.filename,
+          mime: descriptor.mime,
+          size: descriptor.size,
+          cryptoKey: descriptor.cryptoKey,
+          iv: descriptor.iv,
+        },
+        reactions: {},
+        ts: entry.ts,
+      },
+      kind,
+      selectedPeerId,
+      false
+    );
+  } else {
+    renderMessage({ id: `${entry.ts}-${entry.from}`, from: entry.from, text: entry.text, reactions: {}, ts: entry.ts }, kind, selectedPeerId, false);
+  }
+}
+
 async function selectPeer(peerId) {
   selectedPeerId = peerId;
   selectedChannelId = null;
+  closeReactionPicker();
   renderRoster();
   renderChannels();
   const member = roster.find((m) => m.id === peerId);
@@ -585,28 +996,70 @@ async function selectPeer(peerId) {
     addBubble('No messages yet. Anything you send here is end-to-end encrypted.', 'system');
   }
   for (const entry of history) {
-    addBubble(entry.text, entry.from === session.user.id ? 'mine' : 'theirs');
+    renderDmHistoryEntry(entry);
   }
 }
 
 async function sendCurrentMessage() {
   const text = els['composer-input'].value.trim();
-  if (!text) return;
+  const files = pendingFiles.slice();
+  if (!text && files.length === 0) return;
   if (!selectedPeerId && !selectedChannelId) return;
 
   els['composer-input'].value = '';
+  clearPendingFiles();
   els['composer-send'].disabled = true;
   els['composer-error'].textContent = '';
   try {
     if (selectedChannelId) {
-      sendChannelMessage(selectedChannelId, text);
-      // Do not addBubble here: the server echoes every room_message back to
+      // channel_messages.attachment_json holds exactly one attachment per
+      // row, so each file goes out as its own message; any typed text
+      // rides along on the last one.
+      if (files.length > 0) {
+        for (let i = 0; i < files.length; i++) {
+          const uploaded = await uploadChannelFile(selectedChannelId, files[i]);
+          sendChannelMessage(selectedChannelId, i === files.length - 1 ? text : '', uploaded);
+        }
+      } else {
+        sendChannelMessage(selectedChannelId, text);
+      }
+      // Do not render here: the server echoes every room_message back to
       // all channel members (including the sender), and the socket listener
-      // below already renders it. Rendering it here too caused duplicates.
+      // already renders it. Rendering it here too caused duplicates.
+    } else if (files.length > 0) {
+      for (const file of files) {
+        const uploaded = await uploadDmFile(selectedPeerId, file);
+        const descriptor = {
+          __lvoAttachment: true,
+          storageKey: uploaded.storageKey,
+          filename: uploaded.filename,
+          mime: uploaded.mime,
+          size: uploaded.size,
+          cryptoKey: uploaded.rawKeyB64,
+          iv: uploaded.ivB64,
+        };
+        await client.sendMessage(selectedPeerId, JSON.stringify(descriptor));
+        const ts = Date.now();
+        renderMessage(
+          { id: `local-${ts}-${Math.random()}`, from: session.user.id, text: '', attachment: { filename: uploaded.filename, mime: uploaded.mime, size: uploaded.size, localUrl: URL.createObjectURL(file) }, reactions: {}, ts },
+          'mine',
+          selectedPeerId,
+          false
+        );
+        await appendHistory(selectedPeerId, { from: session.user.id, text: JSON.stringify(descriptor), ts });
+      }
+      if (text) {
+        await client.sendMessage(selectedPeerId, text);
+        const ts = Date.now();
+        renderMessage({ id: `local-${ts}`, from: session.user.id, text, reactions: {}, ts }, 'mine', selectedPeerId, false);
+        await appendHistory(selectedPeerId, { from: session.user.id, text, ts });
+      }
+      await idbSet(`client:${session.user.id}`, client.export());
     } else {
       await client.sendMessage(selectedPeerId, text);
-      addBubble(text, 'mine');
-      await appendHistory(selectedPeerId, { from: session.user.id, text, ts: Date.now() });
+      const ts = Date.now();
+      renderMessage({ id: `local-${ts}`, from: session.user.id, text, reactions: {}, ts }, 'mine', selectedPeerId, false);
+      await appendHistory(selectedPeerId, { from: session.user.id, text, ts });
       await idbSet(`client:${session.user.id}`, client.export());
     }
   } catch (e) {
