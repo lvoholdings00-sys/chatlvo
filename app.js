@@ -183,7 +183,7 @@ const els = {};
   'app-screen', 'rail', 'chat-pane', 'me-avatar', 'me-name', 'leader-badge', 'open-avatar-modal',
   'channels-list', 'roster-list', 'admin-link', 'logout-btn',
   'settings-btn', 'settings-popover', 'settings-avatar-btn',
-  'chat-empty', 'chat-active', 'chat-back-btn', 'peer-avatar', 'peer-name', 'status-dot', 'status-text',
+  'chat-empty', 'chat-active', 'chat-back-btn', 'peer-avatar', 'peer-name', 'status-dot', 'status-text', 'reset-session-btn',
   'messages', 'composer-input', 'composer-send', 'composer-row', 'composer-error', 'composer-locked',
   'composer-file-input', 'composer-attach-btn', 'attachment-preview',
   'composer-gif-btn', 'gif-modal', 'gif-search-input', 'gif-grid', 'gif-error', 'gif-cancel',
@@ -1021,6 +1021,7 @@ async function selectChannel(channelId) {
   els['peer-avatar'].style.background = '';
   els['peer-avatar'].textContent = channelIcon(ch ? ch.type : 'group');
   els['peer-name'].textContent = ch ? ch.name : channelId;
+  els['reset-session-btn'].classList.add('hidden'); // channels aren't E2EE — nothing to reset
   setStatus(socket && socket.readyState === 1 ? 'secured' : '', socket && socket.readyState === 1 ? 'Connected' : 'Connecting…');
 
   updateComposerForChannel(ch);
@@ -1253,6 +1254,23 @@ function addBubble(text, kind) {
   els['messages'].scrollTop = els['messages'].scrollHeight;
 }
 
+// Drops the cached Double Ratchet session (and any half-finished handshake)
+// for one peer. Needed when the peer generated a brand-new E2EE identity
+// (e.g. a fresh-start login with no backup) — sendMessage() only ever
+// re-runs the X3DH handshake when this.sessions[peerId] is missing, so
+// without this the two sides are permanently stuck encrypting/decrypting
+// against identities the other side no longer has. The next message sent
+// after this fetches the peer's *current* published bundle and re-keys.
+async function resetPeerSession(peerId) {
+  if (!client) return;
+  delete client.sessions[peerId];
+  delete client.pendingHandshake[peerId];
+  await idbSet(`client:${session.user.id}`, client.export());
+  if (selectedPeerId === peerId) {
+    addBubble('Secure session reset. It will re-establish with their current keys on your next message.', 'system');
+  }
+}
+
 async function loadHistory(peerId) {
   const all = (await idbGet(`history:${session.user.id}`)) || {};
   return all[peerId] || [];
@@ -1436,6 +1454,7 @@ async function selectPeer(peerId) {
   els['chat-active'].classList.remove('hidden');
   renderAvatar(els['peer-avatar'], member.id, member.avatar, member.displayName);
   els['peer-name'].textContent = member.displayName;
+  els['reset-session-btn'].classList.remove('hidden');
   setStatus(socket && socket.readyState === 1 ? 'secured' : '', socket && socket.readyState === 1 ? 'Connected' : 'Connecting…');
 
   updateComposerForChannel(null);
@@ -1893,6 +1912,12 @@ els['composer-input'].addEventListener('keydown', (e) => {
 els['composer-input'].addEventListener('input', updateSendButtonState);
 
 // ---- logout ----
+els['reset-session-btn'].addEventListener('click', () => {
+  if (!selectedPeerId) return;
+  const member = roster.find((m) => m.id === selectedPeerId);
+  const ok = confirm(`Reset the secure session with ${member ? member.displayName : selectedPeerId}? Do this if messages aren't decrypting — it will re-establish encryption using their current keys.`);
+  if (ok) resetPeerSession(selectedPeerId);
+});
 els['logout-btn'].addEventListener('click', () => {
   if (socket) socket.close();
   clearSession();
