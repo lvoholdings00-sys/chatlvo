@@ -120,6 +120,7 @@ const els = {};
   'pwd-modal', 'pwd-new', 'pwd-error', 'pwd-save',
   'app-screen', 'me-avatar', 'me-name', 'leader-badge', 'open-avatar-modal',
   'channels-list', 'roster-list', 'admin-link', 'logout-btn',
+  'settings-btn', 'settings-popover', 'settings-avatar-btn',
   'chat-empty', 'chat-active', 'peer-avatar', 'peer-name', 'status-dot', 'status-text',
   'messages', 'composer-input', 'composer-send', 'composer-row', 'composer-error', 'composer-locked',
   'composer-file-input', 'composer-attach-btn', 'attachment-preview',
@@ -1390,6 +1391,32 @@ els['admin-link'] && els['admin-link'].addEventListener('click', showAdmin);
 els['close-admin'] && els['close-admin'].addEventListener('click', hideAdmin);
 
 // ---------------------------------------------------------------------
+// settings popover (bottom-left of the rail): change picture, admin
+// panel link (admins only), log out — replaces the old two-button footer
+// ---------------------------------------------------------------------
+function openAvatarModal() {
+  els['avatar-error'].textContent = '';
+  renderAvatar(els['upload-preview'], session.user.id, session.user.avatar, session.user.displayName);
+  els['avatar-modal'].classList.remove('hidden');
+}
+function closeSettingsPopover() {
+  els['settings-popover'] && els['settings-popover'].classList.add('hidden');
+}
+els['settings-btn'] && els['settings-btn'].addEventListener('click', (e) => {
+  e.stopPropagation();
+  els['settings-popover'].classList.toggle('hidden');
+});
+document.addEventListener('click', (e) => {
+  const pop = els['settings-popover'];
+  if (!pop || pop.classList.contains('hidden')) return;
+  if (!pop.contains(e.target) && e.target !== els['settings-btn']) closeSettingsPopover();
+});
+els['settings-popover'] && els['settings-popover'].addEventListener('click', (e) => {
+  if (e.target.closest('button, a')) closeSettingsPopover();
+});
+els['settings-avatar-btn'] && els['settings-avatar-btn'].addEventListener('click', openAvatarModal);
+
+// ---------------------------------------------------------------------
 // screen wiring
 // ---------------------------------------------------------------------
 function showLogin() {
@@ -1500,11 +1527,7 @@ els['logout-btn'].addEventListener('click', () => {
 });
 
 // ---- avatar modal ----
-els['open-avatar-modal'].addEventListener('click', () => {
-  els['avatar-error'].textContent = '';
-  renderAvatar(els['upload-preview'], session.user.id, session.user.avatar, session.user.displayName);
-  els['avatar-modal'].classList.remove('hidden');
-});
+els['open-avatar-modal'].addEventListener('click', openAvatarModal);
 els['avatar-cancel'].addEventListener('click', () => els['avatar-modal'].classList.add('hidden'));
 document.querySelectorAll('.tab-btn[data-tab]').forEach((btn) => {
   btn.addEventListener('click', () => {
