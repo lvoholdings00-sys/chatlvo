@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
 <title>LVO — secure line</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -17,8 +17,8 @@
 <section id="login-screen">
   <a class="back-to-site login-back" href="https://online.lvo-cloud.cloud">← Back to lvo-cloud.cloud</a>
   <form class="login-card" id="login-form">
-    <p class="wordmark">LVO</p>
-    <p class="tagline">Secure line. Members only — accounts are created by the admin.</p>
+    <p class="wordmark">𝐋𝐕𝐎</p>
+    <p class="tagline">Secure line. Members only — Accounts are created by the 𝐋𝐕𝐎 Gatekeepers.</p>
 
     <div class="field">
       <label for="login-username">Username</label>
@@ -51,9 +51,9 @@
 
 <!-- ---------------- App ---------------- -->
 <section id="app-screen" class="hidden">
-  <aside class="rail">
+  <aside class="rail" id="rail">
     <div class="rail-header">
-      <p class="rail-brand">LVO</p>
+      <p class="rail-brand">𝐋𝐕𝐎</p>
       <a class="back-to-site" href="https://online.lvo-cloud.cloud">← lvo-cloud.cloud</a>
       <div class="me-row">
         <div class="avatar avatar-sm" id="me-avatar"></div>
@@ -84,11 +84,14 @@
     </div>
   </aside>
 
-  <main class="chat-pane">
+  <main class="chat-pane" id="chat-pane">
     <div id="chat-empty" class="chat-empty">Pick a channel or a member from the left to start a conversation.</div>
 
     <div id="chat-active" class="hidden" style="display:contents;">
       <div class="chat-header">
+        <button class="icon-btn chat-back-btn" id="chat-back-btn" title="Back">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+        </button>
         <div class="avatar avatar-lg" id="peer-avatar"></div>
         <div>
           <div class="chat-peer-name" id="peer-name"></div>
@@ -198,7 +201,7 @@
 <section id="admin-screen" class="hidden">
   <div class="admin-wrap">
     <div class="admin-top">
-      <h1 class="admin-title">LVO — admin</h1>
+      <h1 class="admin-title">𝐋𝐕𝐎 — admin</h1>
       <button class="back-link" id="close-admin">← Back to chat</button>
     </div>
 
