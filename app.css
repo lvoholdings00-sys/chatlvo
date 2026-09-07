@@ -1127,3 +1127,9 @@ emoji-picker {
   overflow: hidden;
 }
 .gif-choice img { width: 100%; display: block; }
+
+.modal-divider {
+  border: none;
+  border-top: 1px solid var(--hairline);
+  margin: 18px 0;
+}
