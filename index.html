@@ -222,6 +222,45 @@
   </div>
 </section>
 
+<!-- ---------------- Message bubble template (cloned by app.js per message) ---------------- -->
+<template id="message-template">
+  <div class="message" data-message-id="" data-from="">
+    <div class="avatar avatar-sm message-avatar"></div>
+    <div class="message-body">
+      <div class="message-meta">
+        <span class="message-author"></span>
+        <span class="message-time"></span>
+      </div>
+      <div class="message-bubble">
+        <div class="message-attachments"></div>
+        <div class="message-text"></div>
+      </div>
+      <div class="message-reactions hidden"></div>
+    </div>
+    <div class="message-hover-actions">
+      <button class="icon-btn message-react-btn" type="button" title="React">🙂</button>
+    </div>
+  </div>
+</template>
+
+<!-- ---------------- Reaction pill template (cloned per emoji group under a message) ---------------- -->
+<template id="reaction-pill-template">
+  <button class="reaction-pill" type="button" data-emoji="">
+    <span class="reaction-emoji"></span>
+    <span class="reaction-count"></span>
+  </button>
+</template>
+
+<!-- ---------------- Reaction picker popup (positioned near the message that was hovered/tapped) ---------------- -->
+<div class="reaction-picker hidden" id="reaction-picker">
+  <button class="reaction-picker-emoji" type="button" data-emoji="👍">👍</button>
+  <button class="reaction-picker-emoji" type="button" data-emoji="❤️">❤️</button>
+  <button class="reaction-picker-emoji" type="button" data-emoji="😂">😂</button>
+  <button class="reaction-picker-emoji" type="button" data-emoji="😮">😮</button>
+  <button class="reaction-picker-emoji" type="button" data-emoji="😢">😢</button>
+  <button class="reaction-picker-emoji" type="button" data-emoji="🙏">🙏</button>
+</div>
+
 <!-- ---------------- Attachment bubble template (cloned by app.js per message) ---------------- -->
 <template id="attachment-bubble-template">
   <div class="attachment-bubble" data-kind="">
