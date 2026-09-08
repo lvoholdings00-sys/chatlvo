@@ -234,11 +234,23 @@
 
     <div class="card">
       <h2>DIRECT MESSAGES</h2>
-      <p class="hint-text" style="margin-top:0;">Direct messages stay end-to-end encrypted — this shows only who's talked to whom and when, never message content.</p>
+      <p class="hint-text" style="margin-top:0;">Direct messages are stored in plaintext and are visible to admins. Click a thread to review its full message history.</p>
       <div id="dm-thread-list"></div>
     </div>
   </div>
 </section>
+
+<!-- ---------------- Admin DM viewer (read-only) ---------------- -->
+<div class="modal-backdrop hidden" id="admin-dm-viewer-modal">
+  <div class="modal admin-dm-viewer-modal">
+    <div class="chat-header" style="padding:0 0 12px;">
+      <div id="admin-dm-viewer-title" class="chat-peer-name"></div>
+      <button class="icon-btn" id="admin-dm-viewer-close" title="Close" style="margin-left:auto;">✕</button>
+    </div>
+    <p class="hint-text" style="margin-top:0;">Read-only admin view. This thread's messages are not editable here.</p>
+    <div class="messages" id="admin-dm-viewer-messages" style="max-height:60vh; overflow-y:auto;"></div>
+  </div>
+</div>
 
 <!-- ---------------- Message bubble template (cloned by app.js per message) ---------------- -->
 <template id="message-template">
