@@ -125,6 +125,33 @@ let calendarSelectedDate = null; // 'YYYY-MM-DD'
 // NEW: news state
 let newsPosts = [];
 
+// NEW: recent chats (client-side, per-account, localStorage-persisted).
+// [{ id: peerId, ts }], most-recent first. There's no "recent DMs"
+// concept on the backend today, so this just tracks conversations the
+// current browser has opened or received a message in.
+let recentChats = [];
+
+// NEW: local message cache, used so search can actually find message
+// text without a backend endpoint. Keyed by "channel:<id>" / "dm:<id>"
+// -> Map(messageId -> { id, text, ts, from, fromName, channelId, dmPeerId }).
+// This only covers conversations you've actually opened in this browser
+// session (or before, if you've opened them earlier and they're still
+// in the currently-loaded history) — it is NOT full server-side search
+// across every message ever sent. See the /search API CONTRACT note
+// near performGlobalSearch() for what real full-history search needs.
+let messageCache = {};
+function cacheMessage(scopeKey, msg, extra) {
+  if (!messageCache[scopeKey]) messageCache[scopeKey] = new Map();
+  messageCache[scopeKey].set(msg.id, {
+    id: msg.id,
+    text: msg.text || '',
+    ts: msg.ts || Date.now(),
+    from: msg.from,
+    fromName: msg.fromName,
+    ...extra,
+  });
+}
+
 // NEW: search debounce
 let globalSearchDebounce = null;
 
@@ -204,12 +231,12 @@ const els = {};
   'new-username', 'new-displayname', 'new-password', 'create-btn', 'create-error', 'user-list',
   'admin-new-channel', 'admin-channel-list', 'dm-thread-list',
   // NEW: calendar
-  'calendar-view', 'cal-prev', 'cal-next', 'cal-month-label', 'cal-new-event-btn',
+  'calendar-view', 'calendar-back-btn', 'cal-prev', 'cal-next', 'cal-month-label', 'cal-new-event-btn',
   'calendar-dow-row', 'calendar-grid', 'cal-selected-day-label', 'cal-day-events',
   'event-modal', 'event-title', 'event-date', 'event-time', 'event-desc', 'event-error',
   'event-cancel', 'event-save',
   // NEW: news
-  'news-view', 'news-compose', 'news-title-input', 'news-body-input', 'news-pin-checkbox',
+  'news-view', 'news-back-btn', 'news-compose', 'news-title-input', 'news-body-input', 'news-pin-checkbox',
   'news-error', 'news-post-btn', 'news-feed',
 ].forEach((id) => (els[id] = document.getElementById(id)));
 
@@ -241,6 +268,20 @@ function switchTab(tab) {
 
   closeSearchResults();
 
+  // MOBILE FIX: below the mobile breakpoint, #app-screen only shows the
+  // rail OR the main pane, switched by the "chat-open" class (see the
+  // MOBILE NAV note at the top of this file). That class previously
+  // only got added when a channel/DM was selected, so Calendar and News
+  // rendered into a pane that was still hidden on phones — nothing
+  // visibly showed up even though the DOM was populated correctly.
+  // Calendar/News now count as "open" content too; Chat only opens the
+  // pane once something is actually selected.
+  if (tab === 'calendar' || tab === 'news') {
+    openChatPaneMobile();
+  } else if (!selectedPeerId && !selectedChannelId) {
+    closeChatPaneMobile();
+  }
+
   if (tab === 'calendar') {
     renderCalendarMonth();
   } else if (tab === 'news') {
@@ -251,6 +292,12 @@ els['top-tabs'] && els['top-tabs'].addEventListener('click', (e) => {
   const btn = e.target.closest('.top-tab');
   if (btn) switchTab(btn.dataset.tab);
 });
+// Back buttons inside Calendar/News (mobile only — same chat-back-btn
+// class as the chat header's back button, so it's hidden on desktop by
+// whatever rule already hides that one). Going back just re-reveals the
+// rail; the tab itself stays selected so re-opening it is one tap.
+els['calendar-back-btn'] && els['calendar-back-btn'].addEventListener('click', closeChatPaneMobile);
+els['news-back-btn'] && els['news-back-btn'].addEventListener('click', closeChatPaneMobile);
 
 // =======================================================================
 // NEW: Calendar
@@ -582,6 +629,38 @@ els['news-post-btn'] && els['news-post-btn'].addEventListener('click', async () 
 // If that endpoint 404s or errors, search still works for people and
 // channels; the Messages section is just quietly omitted.
 // =======================================================================
+// =======================================================================
+// NEW: Global search (Teams-style "Search or type a command")
+//
+// Channels and members are matched client-side against roster/channels
+// already loaded. Messages are matched two ways:
+//   1) Client-side, against messageCache (see cacheMessage()) — this
+//      only covers conversations already opened in this browser, so it
+//      is NOT full history search.
+//   2) Server-side, via GET /search?q=... -> { messages: [
+//      { id, text, ts, from, fromName, channelId, channelName, dmPeerId, dmPeerName } ] }
+//      This is what actually searches "everything on the site" —
+//      every message ever sent, not just what's been loaded locally.
+//      THIS ROUTE DOES NOT EXIST ON THE BACKEND YET, so today search
+//      quietly falls back to client-cache-only results. Add it to your
+//      Worker (same auth/shape as your other endpoints — likely a LIKE
+//      query over your messages table, scoped to channels the caller is
+//      in plus DMs they're a participant of, or unrestricted for admins)
+//      and full-site message search will start working with no
+//      frontend changes needed.
+// =======================================================================
+function searchMessageCache(query) {
+  const q = query.toLowerCase();
+  const hits = [];
+  for (const scopeKey of Object.keys(messageCache)) {
+    for (const entry of messageCache[scopeKey].values()) {
+      if (entry.text && entry.text.toLowerCase().includes(q)) hits.push(entry);
+    }
+  }
+  hits.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  return hits;
+}
+
 function closeSearchResults() {
   els['search-results'] && els['search-results'].classList.add('hidden');
 }
@@ -629,12 +708,21 @@ async function performGlobalSearch(query) {
     (m) => m.displayName.toLowerCase().includes(q) || m.id.toLowerCase().includes(q)
   );
 
-  let matchingMessages = [];
+  let matchingMessages = searchMessageCache(q);
   try {
     const data = await api(`/search?q=${encodeURIComponent(query.trim())}`, { token: session.token });
-    matchingMessages = data.messages || [];
+    const serverHits = data.messages || [];
+    const seen = new Set(matchingMessages.map((m) => m.id));
+    for (const hit of serverHits) {
+      if (!seen.has(hit.id)) {
+        matchingMessages.push(hit);
+        seen.add(hit.id);
+      }
+    }
+    matchingMessages.sort((a, b) => (b.ts || 0) - (a.ts || 0));
   } catch {
-    matchingMessages = []; // endpoint may not exist yet — fail quietly, see contract note above
+    // /search doesn't exist on the backend yet — matchingMessages just
+    // stays as whatever the local cache found. See API CONTRACT note above.
   }
 
   if (matchingChannels.length === 0 && matchingMembers.length === 0 && matchingMessages.length === 0) {
@@ -693,6 +781,11 @@ async function performGlobalSearch(query) {
         },
       });
     }
+    const note = document.createElement('div');
+    note.className = 'search-empty';
+    note.style.fontSize = '11px';
+    note.textContent = 'Message results are limited to conversations you\u2019ve opened before.';
+    container.appendChild(note);
   }
 }
 
@@ -1215,7 +1308,19 @@ function renderMessage(msg, kind, scopeId, isChannel) {
 }
 
 // ---------------------------------------------------------------------
-// roster — search-first
+// roster + recent chats
+//
+// The "MEMBERS" list used to only render when a (now-removed) search
+// box had text in it, so in practice it always sat empty — that's the
+// blank space under Chat you were seeing. It's now a "RECENT CHATS"
+// list instead, Teams/Telegram-style: whoever you've opened a DM with
+// or gotten a DM from recently, most-recent first. Finding *new*
+// people to message is what the global search bar at the top is for.
+//
+// This is tracked client-side (per browser, per account) in
+// localStorage — there's no "recent DMs" concept on the backend, so a
+// second device won't share this list until/unless that's added
+// server-side.
 // ---------------------------------------------------------------------
 async function loadRoster() {
   const data = await api('/roster', { token: session.token });
@@ -1225,23 +1330,50 @@ async function loadRoster() {
   buildPresetGrid();
 }
 
-function renderRoster() {
-  const query = (els['roster-search-input'] && els['roster-search-input'].value.trim().toLowerCase()) || '';
-  els['roster-list'].innerHTML = '';
-  els['roster-list'].classList.toggle('hidden', query.length === 0);
-  if (query.length === 0) return;
+function recentChatsStorageKey() {
+  return `lvo_recent_chats_${session.user.id}`;
+}
+function loadRecentChatsFromStorage() {
+  try {
+    recentChats = JSON.parse(localStorage.getItem(recentChatsStorageKey()) || '[]');
+  } catch {
+    recentChats = [];
+  }
+}
+function saveRecentChatsToStorage() {
+  try {
+    localStorage.setItem(recentChatsStorageKey(), JSON.stringify(recentChats));
+  } catch {
+    // storage full/unavailable — recent chats just won't persist this session
+  }
+}
+function touchRecentChat(peerId) {
+  if (!peerId) return;
+  recentChats = recentChats.filter((r) => r.id !== peerId);
+  recentChats.unshift({ id: peerId, ts: Date.now() });
+  recentChats = recentChats.slice(0, 20);
+  saveRecentChatsToStorage();
+  renderRoster();
+}
 
-  const matches = roster.filter(
-    (m) => m.displayName.toLowerCase().includes(query) || m.id.toLowerCase().includes(query)
-  );
-  if (matches.length === 0) {
+function renderRoster() {
+  const container = els['roster-list'];
+  container.innerHTML = '';
+  container.classList.remove('hidden');
+
+  const entries = recentChats
+    .map((r) => roster.find((m) => m.id === r.id))
+    .filter(Boolean);
+
+  if (entries.length === 0) {
     const empty = document.createElement('p');
     empty.className = 'roster-empty';
-    empty.textContent = 'No members match that search.';
-    els['roster-list'].appendChild(empty);
+    empty.textContent = 'No recent chats yet — search above to message someone.';
+    container.appendChild(empty);
     return;
   }
-  for (const member of matches) {
+
+  for (const member of entries) {
     const btn = document.createElement('button');
     btn.className = 'roster-item' + (member.id === selectedPeerId && !selectedChannelId ? ' active' : '');
     const avatarEl = document.createElement('div');
@@ -1252,15 +1384,10 @@ function renderRoster() {
     name.textContent = member.displayName;
     btn.appendChild(avatarEl);
     btn.appendChild(name);
-    btn.addEventListener('click', () => {
-      selectPeer(member.id);
-      els['roster-search-input'].value = '';
-      renderRoster();
-    });
-    els['roster-list'].appendChild(btn);
+    btn.addEventListener('click', () => selectPeer(member.id));
+    container.appendChild(btn);
   }
 }
-els['roster-search-input'] && els['roster-search-input'].addEventListener('input', renderRoster);
 
 // ---------------------------------------------------------------------
 // channels
@@ -1346,6 +1473,7 @@ async function selectChannel(channelId) {
   }
   for (const entry of history) {
     renderMessage(entry, entry.from === session.user.id ? 'mine' : 'theirs', channelId, true);
+    cacheMessage(`channel:${channelId}`, entry, { channelId, channelName: ch ? ch.name : channelId });
   }
 }
 
@@ -1626,6 +1754,12 @@ function initClient() {
 
       if (payload.type === 'dm_message') {
         const otherParty = payload.from === session.user.id ? payload.to : payload.from;
+        touchRecentChat(otherParty);
+        const peerMember = roster.find((m) => m.id === otherParty);
+        cacheMessage(`dm:${otherParty}`, payload, {
+          dmPeerId: otherParty,
+          dmPeerName: peerMember ? peerMember.displayName : otherParty,
+        });
         if (selectedPeerId === otherParty) {
           renderMessage(
             { id: payload.id, from: payload.from, text: payload.text, attachment: payload.attachment, reactions: {}, ts: payload.ts },
@@ -1641,6 +1775,11 @@ function initClient() {
         return;
       }
       if (payload.type === 'room_message') {
+        const ch = channels.find((c) => c.id === payload.channelId);
+        cacheMessage(`channel:${payload.channelId}`, payload, {
+          channelId: payload.channelId,
+          channelName: ch ? ch.name : payload.channelId,
+        });
         if (selectedChannelId === payload.channelId) {
           renderMessage(
             { id: payload.id, from: payload.from, fromName: payload.fromName, text: payload.text, attachment: payload.attachment, reactions: {}, ts: payload.ts },
@@ -1650,7 +1789,6 @@ function initClient() {
           );
         }
         if (payload.from !== session.user.id) {
-          const ch = channels.find((c) => c.id === payload.channelId);
           notifyIncoming(payload.channelId, true, `${ch ? ch.name : payload.channelId}: ${payload.fromName || payload.from}`, payload.text || 'Sent an attachment');
         }
         return;
@@ -1697,6 +1835,7 @@ function initClient() {
 async function selectPeer(peerId) {
   selectedPeerId = peerId;
   selectedChannelId = null;
+  touchRecentChat(peerId);
   closeReactionPicker();
   renderRoster();
   renderChannels();
@@ -1724,6 +1863,7 @@ async function selectPeer(peerId) {
   }
   for (const entry of history) {
     renderMessage(entry, entry.from === session.user.id ? 'mine' : 'theirs', peerId, false);
+    cacheMessage(`dm:${peerId}`, entry, { dmPeerId: peerId, dmPeerName: member.displayName });
   }
 }
 
@@ -2101,6 +2241,7 @@ async function boot() {
     els['pwd-modal'].classList.remove('hidden');
     return;
   }
+  loadRecentChatsFromStorage();
   await loadRoster();
   await loadMutedConvos();
   showApp();
@@ -2142,6 +2283,7 @@ els['pwd-save'].addEventListener('click', async () => {
     session.user.mustChangePassword = false;
     saveSession(session);
     els['pwd-modal'].classList.add('hidden');
+    loadRecentChatsFromStorage();
     await loadRoster();
     await loadMutedConvos();
     showApp();
