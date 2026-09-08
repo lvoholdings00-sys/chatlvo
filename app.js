@@ -1,19 +1,14 @@
 /**
  * app.js — LVO chat app shell.
  *
- * Wires: login -> roster (admin-controlled account list) -> E2EE chat
- * per selected member, using the SDK bundle from sdk/e2ee-sdk.bundle.js
- * (window.E2EE) for the actual X3DH + Double Ratchet work. Direct
- * messages are never touched in plaintext by this file before
- * encryption or after decryption in a way that leaves this file.
- *
- * Channels (General / Group / Announcement) are a separate, plaintext,
- * server-stored broadcast system — sent as `room_send` over the same
- * websocket, persisted server-side, and visible to admins for
- * oversight. That's a deliberate trade-off, not an oversight: direct
- * messages are the secure line, channels are the compliance-monitored
- * team space (same idea "General" always advertised, now finished and
- * extended to Group/Announcement channels).
+ * Wires: login -> roster (admin-controlled account list) -> chat per
+ * selected member or channel, all over one websocket to the relay
+ * Worker. There is no client-side encryption anywhere in this file —
+ * direct messages and channel messages are both plaintext, both
+ * persisted server-side (Supabase), and both visible to admins for
+ * oversight. Same trust tier, same code path (renderMessage etc. is
+ * shared between the two) — a DM is just a channel with exactly one
+ * other member.
  *
  * The admin panel (member management, channel management, DM activity
  * overview) lives in this same page as a toggled view — there is no
@@ -28,26 +23,11 @@
  * breakpoint since the desktop grid always shows both panes regardless
  * of the class.
  *
- * PERFORMANCE NOTE: sdk/e2ee-sdk.bundle.js (the crypto library) and the
- * emoji-picker-element web component are both loaded lazily from this
- * file (see loadScriptOnce / ensureEmojiPicker below) instead of via
- * <script> tags in index.html. Neither is needed to render or use the
- * login screen, so loading them unconditionally on every page load was
- * adding several seconds of dead weight before the login form was even
- * usable. The SDK now loads right before it's first needed (inside
- * initClient(), which only runs after a successful login), and the
- * emoji picker is prefetched quietly in the background right after
- * login so it's warm by the time someone opens the reaction picker.
- *
- * E2EE IDENTITY RECOVERY (see initClient / promptForRestoreOrFreshStart
- * below): if this device has no local E2EE state, we NEVER silently
- * generate a brand-new identity when a server-side backup exists for
- * this account. Doing so used to happen implicitly whenever a native
- * prompt() for the restore password was dismissed/cancelled, which
- * quietly overwrote the account's published key bundle and broke every
- * existing session other people had with this account. Generating a
- * fresh identity now requires an explicit, confirmed choice through a
- * real modal (#restore-modal) — see promptForRestoreOrFreshStart().
+ * PERFORMANCE NOTE: the emoji-picker-element web component is loaded
+ * lazily (see ensureEmojiPicker below) instead of via a <script> tag in
+ * index.html — it isn't needed to render or use the login screen, so
+ * it's prefetched quietly in the background right after login instead,
+ * so it's warm by the time someone opens the reaction picker.
  */
 
 
@@ -83,35 +63,6 @@ function ensureEmojiPicker() {
     emojiPickerLoadPromise = import('https://cdn.jsdelivr.net/npm/emoji-picker-element@^1/index.js');
   }
   return emojiPickerLoadPromise;
-}
-
-// ---------------------------------------------------------------------
-// tiny IndexedDB key-value store (crypto key material + local DM log)
-// ---------------------------------------------------------------------
-function idbGet(key) {
-  return new Promise((resolve) => {
-    const req = indexedDB.open('lvo-chat', 1);
-    req.onupgradeneeded = () => req.result.createObjectStore('kv');
-    req.onsuccess = () => {
-      const tx = req.result.transaction('kv', 'readonly');
-      const g = tx.objectStore('kv').get(key);
-      g.onsuccess = () => resolve(g.result ?? null);
-      g.onerror = () => resolve(null);
-    };
-    req.onerror = () => resolve(null);
-  });
-}
-function idbSet(key, value) {
-  return new Promise((resolve) => {
-    const req = indexedDB.open('lvo-chat', 1);
-    req.onupgradeneeded = () => req.result.createObjectStore('kv');
-    req.onsuccess = () => {
-      const tx = req.result.transaction('kv', 'readwrite');
-      tx.objectStore('kv').put(value, key);
-      tx.oncomplete = () => resolve();
-    };
-    req.onerror = () => resolve();
-  });
 }
 
 // ---------------------------------------------------------------------
@@ -157,7 +108,7 @@ let presetsById = {};
 let channels = []; // [{id, name, type, memberCount, canPost}]
 let selectedPeerId = null;
 let selectedChannelId = null; // mutually exclusive with selectedPeerId
-let client = null;
+
 let socket = null;
 const avatarBlobCache = new Map(); // userId -> object URL
 const channelTypeById = {}; // scratch used while building the create-channel modal
@@ -179,11 +130,10 @@ const els = {};
 [
   'login-screen', 'login-form', 'login-username', 'login-password', 'login-submit', 'login-error',
   'pwd-modal', 'pwd-new', 'pwd-error', 'pwd-save',
-  'restore-modal', 'restore-password', 'restore-error', 'restore-submit', 'restore-skip',
   'app-screen', 'rail', 'chat-pane', 'me-avatar', 'me-name', 'leader-badge', 'open-avatar-modal',
   'channels-list', 'roster-list', 'admin-link', 'logout-btn',
   'settings-btn', 'settings-popover', 'settings-avatar-btn',
-  'chat-empty', 'chat-active', 'chat-back-btn', 'peer-avatar', 'peer-name', 'status-dot', 'status-text', 'reset-session-btn',
+  'chat-empty', 'chat-active', 'chat-back-btn', 'peer-avatar', 'peer-name', 'status-dot', 'status-text',
   'messages', 'composer-input', 'composer-send', 'composer-row', 'composer-error', 'composer-locked',
   'composer-file-input', 'composer-attach-btn', 'attachment-preview',
   'composer-gif-btn', 'gif-modal', 'gif-search-input', 'gif-grid', 'gif-error', 'gif-cancel',
@@ -208,192 +158,6 @@ function closeChatPaneMobile() {
   els['app-screen'].classList.remove('chat-open');
 }
 els['chat-back-btn'] && els['chat-back-btn'].addEventListener('click', closeChatPaneMobile);
-
-// ---------------------------------------------------------------------
-// cross-device backup — lets logging into the same account on a second
-// device restore both its E2EE identity/session state and its decrypted
-// DM history, instead of starting cold with a brand-new identity and no
-// history (which is what happened before this).
-//
-// The server (see /me/backup in the Worker) only ever stores the
-// ciphertext blob below. The key that encrypts it is derived client-side
-// from the account's login password using PBKDF2 with its own random
-// salt — never the same salt or iteration count the server uses to hash
-// the password for auth — so this stays consistent with the rest of the
-// app's trust model: the server can't read it.
-//
-// Real limits worth knowing:
-//   - This only works on a device where the person has actually typed
-//     their password in this tab (fresh login, or the forced first-time
-//     password change). A reloaded tab with a persisted session token
-//     but no local IndexedDB state has to ask for the password once to
-//     attempt a restore (see promptForRestoreOrFreshStart / initClient
-//     below).
-//   - If the password changes, the old backup is invalidated server-side
-//     (see handleAdminResetPassword) since it was encrypted with a key
-//     derived from the old password. The next device that pushes a
-//     backup under the new password starts a fresh one.
-// ---------------------------------------------------------------------
-let sessionPassword = null; // in-memory only for this tab; never persisted to localStorage/IndexedDB
-let backupPushDebounce = null;
-const BACKUP_PBKDF2_ITERATIONS = 200_000;
-
-function bytesToB64(bytes) {
-  let bin = '';
-  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-  return btoa(bin);
-}
-function b64ToBytes(b64) {
-  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-}
-
-async function deriveBackupKey(password, saltB64) {
-  const salt = b64ToBytes(saltB64);
-  const keyMaterial = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']);
-  return crypto.subtle.deriveKey(
-    { name: 'PBKDF2', salt, iterations: BACKUP_PBKDF2_ITERATIONS, hash: 'SHA-256' },
-    keyMaterial,
-    { name: 'AES-GCM', length: 256 },
-    false,
-    ['encrypt', 'decrypt']
-  );
-}
-
-// Encrypts this device's exported E2EE client state + decrypted DM
-// history and pushes it to the server, reusing whatever salt is already
-// on file so every device deriving from the same password lands on the
-// same key. Best-effort — failures here should never block sending a
-// message, so callers just fire-and-forget this via scheduleBackupPush.
-async function pushBackupToServer(password) {
-  if (!password || !client || !session) return;
-  try {
-    let saltB64;
-    try {
-      const existing = await api('/me/backup', { token: session.token });
-      saltB64 = existing.salt;
-    } catch {
-      saltB64 = bytesToB64(crypto.getRandomValues(new Uint8Array(16)));
-    }
-    const key = await deriveBackupKey(password, saltB64);
-    const history = (await idbGet(`history:${session.user.id}`)) || {};
-    const payload = { clientState: client.export(), history };
-    const plaintext = new TextEncoder().encode(JSON.stringify(payload));
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plaintext);
-    await api('/me/backup', {
-      method: 'PUT',
-      token: session.token,
-      body: { salt: saltB64, iv: bytesToB64(iv), blob: bytesToB64(new Uint8Array(ciphertext)) },
-    });
-  } catch (e) {
-    console.error('Backup push failed (will retry after the next message)', e);
-  }
-}
-
-// Debounced so a burst of messages doesn't fire a PBKDF2 derivation +
-// upload per message — just once, ~2.5s after things settle.
-function scheduleBackupPush() {
-  if (!sessionPassword) return; // nothing in memory to encrypt with this session
-  clearTimeout(backupPushDebounce);
-  backupPushDebounce = setTimeout(() => pushBackupToServer(sessionPassword), 2500);
-}
-
-// Attempts to pull down and decrypt this account's server-side backup
-// (if any) using `password`, and if successful, seeds this device's local
-// IndexedDB with the restored identity/session state + history so the
-// normal initClient() flow picks it up as if it had always been there.
-// Returns false (not an error) when there's simply no backup yet — that's
-// the expected case for the very first device an account is ever used on.
-async function tryRestoreFromServerBackup(password) {
-  let data;
-  try {
-    data = await api('/me/backup', { token: session.token });
-  } catch {
-    return false;
-  }
-  try {
-    const key = await deriveBackupKey(password, data.salt);
-    const iv = b64ToBytes(data.iv);
-    const ciphertext = b64ToBytes(data.blob);
-    const plaintextBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
-    const payload = JSON.parse(new TextDecoder().decode(plaintextBuf));
-    await idbSet(`client:${session.user.id}`, payload.clientState);
-    await idbSet(`history:${session.user.id}`, payload.history || {});
-    return true;
-  } catch (e) {
-    console.error('Backup restore failed — wrong password derivation, or the backup predates a password change', e);
-    return false;
-  }
-}
-
-// ---------------------------------------------------------------------
-// restore-or-fresh-start modal (see E2EE IDENTITY RECOVERY note at top
-// of file). Blocks until the person either successfully restores from
-// their server backup, or explicitly confirms starting a brand-new
-// identity on this device. There is no silent fallthrough — every path
-// out of this function is a deliberate, confirmed choice.
-// ---------------------------------------------------------------------
-function promptForRestoreOrFreshStart() {
-  return new Promise((resolve) => {
-    const modal = els['restore-modal'];
-    const pwInput = els['restore-password'];
-    const errorEl = els['restore-error'];
-    const submitBtn = els['restore-submit'];
-    const skipBtn = els['restore-skip'];
-
-    errorEl.textContent = '';
-    pwInput.value = '';
-    modal.classList.remove('hidden');
-    pwInput.focus();
-
-    function cleanup() {
-      modal.classList.add('hidden');
-      submitBtn.removeEventListener('click', onSubmit);
-      skipBtn.removeEventListener('click', onSkip);
-      pwInput.removeEventListener('keydown', onKeydown);
-    }
-
-    async function onSubmit() {
-      const pw = pwInput.value;
-      if (!pw) {
-        errorEl.textContent = 'Enter your password, or choose "Start a new identity instead" below.';
-        return;
-      }
-      submitBtn.disabled = true;
-      errorEl.textContent = '';
-      const restored = await tryRestoreFromServerBackup(pw);
-      submitBtn.disabled = false;
-      if (restored) {
-        sessionPassword = pw;
-        cleanup();
-        resolve({ startFresh: false });
-      } else {
-        errorEl.textContent = 'That password did not match your backup. This can also happen after a password reset — try again, or start fresh below.';
-        pwInput.value = '';
-        pwInput.focus();
-      }
-    }
-
-    function onSkip() {
-      if (!confirm('This will start a brand-new secure identity on this device. You will lose access to old conversations here, and contacts will need to re-establish a secure session with you. Continue?')) {
-        return;
-      }
-      cleanup();
-      resolve({ startFresh: true });
-    }
-
-    function onKeydown(e) {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        onSubmit();
-      }
-    }
-
-    submitBtn.addEventListener('click', onSubmit);
-    skipBtn.addEventListener('click', onSkip);
-    pwInput.addEventListener('keydown', onKeydown);
-  });
-}
 
 // ---------------------------------------------------------------------
 // avatar rendering
@@ -480,38 +244,9 @@ async function getChannelFileBlobUrl(storageKey) {
 // DM attachments follow the same trust model as DM text: the Worker only
 // ever sees ciphertext. We encrypt the file locally with a random
 // per-file AES-GCM key before upload, then deliver that key to the
-// recipient inside a normal E2EE ratchet message (as a JSON "descriptor"
-// sent through client.sendMessage), exactly like the Worker comments
-// describe. This uses WebCrypto directly rather than the E2EE SDK, since
-// this is a separate, simpler symmetric-encryption step, not part of the
-// X3DH/ratchet session itself.
-async function encryptBufferForDm(buffer) {
-  const rawKey = crypto.getRandomValues(new Uint8Array(32));
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const cryptoKey = await crypto.subtle.importKey('raw', rawKey, 'AES-GCM', false, ['encrypt']);
-  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, cryptoKey, buffer);
-  return {
-    ciphertext,
-    rawKeyB64: btoa(String.fromCharCode(...rawKey)),
-    ivB64: btoa(String.fromCharCode(...iv)),
-  };
-}
-async function decryptDmFileBuffer(ciphertextBuffer, rawKeyB64, ivB64) {
-  const rawKey = Uint8Array.from(atob(rawKeyB64), (c) => c.charCodeAt(0));
-  const iv = Uint8Array.from(atob(ivB64), (c) => c.charCodeAt(0));
-  const cryptoKey = await crypto.subtle.importKey('raw', rawKey, 'AES-GCM', false, ['decrypt']);
-  return crypto.subtle.decrypt({ name: 'AES-GCM', iv }, cryptoKey, ciphertextBuffer);
-}
-function isAttachmentDescriptor(text) {
-  if (!text || text[0] !== '{') return null;
-  try {
-    const obj = JSON.parse(text);
-    return obj && obj.__lvoAttachment ? obj : null;
-  } catch {
-    return null;
-  }
-}
-
+// Channel and DM attachments both upload plain bytes now — same call
+// shape, different endpoint. The Worker gates read access on channel
+// membership or DM-thread participation (or admin) either way.
 async function uploadChannelFile(channelId, file) {
   const buf = await file.arrayBuffer();
   return api(`/channels/${encodeURIComponent(channelId)}/upload`, {
@@ -524,21 +259,13 @@ async function uploadChannelFile(channelId, file) {
 }
 async function uploadDmFile(peerId, file) {
   const buf = await file.arrayBuffer();
-  const { ciphertext, rawKeyB64, ivB64 } = await encryptBufferForDm(buf);
-  const data = await api('/dm-files/upload', {
+  return api(`/dm/${encodeURIComponent(peerId)}/upload`, {
     method: 'POST',
     token: session.token,
-    rawBody: ciphertext,
-    headers: { 'X-To': peerId },
+    rawBody: buf,
+    contentType: file.type || 'application/octet-stream',
+    headers: { 'X-Filename': encodeURIComponent(file.name) },
   });
-  return {
-    storageKey: data.key,
-    size: data.size,
-    filename: file.name,
-    mime: file.type || 'application/octet-stream',
-    rawKeyB64,
-    ivB64,
-  };
 }
 
 // Resolves an attachment descriptor to a displayable/downloadable blob URL.
@@ -546,21 +273,13 @@ async function uploadDmFile(peerId, file) {
 // (we already have the plaintext bytes, no need to round-trip the server).
 // `attachment.gifUrl` is used for GIPHY picks — GIPHY's CDN URL is used
 // directly, same trust tier as any other external image link.
-async function resolveAttachmentUrl(attachment, isChannel) {
+async function resolveAttachmentUrl(attachment) {
   if (attachment.gifUrl) return attachment.gifUrl;
   if (attachment.localUrl) return attachment.localUrl;
-  if (isChannel) return getChannelFileBlobUrl(attachment.key);
-  const res = await fetch(`${SERVER_URL}/files/${encodeURIComponent(attachment.storageKey)}`, {
-    headers: { Authorization: `Bearer ${session.token}` },
-  });
-  if (!res.ok) throw new Error('Could not load attachment.');
-  const ciphertext = await res.arrayBuffer();
-  const plaintext = await decryptDmFileBuffer(ciphertext, attachment.cryptoKey, attachment.iv);
-  const blob = new Blob([plaintext], { type: attachment.mime || 'application/octet-stream' });
-  return URL.createObjectURL(blob);
+  return getChannelFileBlobUrl(attachment.key);
 }
 
-function renderAttachmentInto(container, attachment, isChannel) {
+function renderAttachmentInto(container, attachment) {
   const tpl = document.getElementById('attachment-bubble-template');
   const node = tpl.content.firstElementChild.cloneNode(true);
   const kind = fileKindFromMime(attachment.mime);
@@ -582,7 +301,7 @@ function renderAttachmentInto(container, attachment, isChannel) {
   fileBox.classList.remove('hidden'); // shown as the fallback / loading state
   container.appendChild(node);
 
-  resolveAttachmentUrl(attachment, isChannel)
+  resolveAttachmentUrl(attachment)
     .then((url) => {
       downloadLink.href = url;
       downloadLink.setAttribute('download', attachment.filename || 'file');
@@ -748,22 +467,14 @@ els['composer-gif-btn'] && els['composer-gif-btn'].addEventListener('click', ope
 
 async function sendGif({ url, title }) {
   els['gif-modal'].classList.add('hidden');
+  const attachment = { gifUrl: url, filename: title || 'GIF', mime: 'image/gif' };
   try {
     if (selectedChannelId) {
-      sendChannelMessage(selectedChannelId, '', { gifUrl: url, filename: title || 'GIF', mime: 'image/gif' });
-      // socket listener renders the server echo — same as file attachments.
+      sendChannelMessage(selectedChannelId, '', attachment);
     } else if (selectedPeerId) {
-      const descriptor = { __lvoAttachment: true, gifUrl: url, filename: title || 'GIF', mime: 'image/gif' };
-      await client.sendMessage(selectedPeerId, JSON.stringify(descriptor));
-      const ts = Date.now();
-      renderMessage(
-        { id: `local-${ts}`, from: session.user.id, text: '', attachment: { gifUrl: url, filename: title || 'GIF', mime: 'image/gif' }, reactions: {}, ts },
-        'mine', selectedPeerId, false
-      );
-      await appendHistory(selectedPeerId, { from: session.user.id, text: JSON.stringify(descriptor), ts });
-      await idbSet(`client:${session.user.id}`, client.export());
-      scheduleBackupPush();
+      sendDmMessage(selectedPeerId, '', attachment);
     }
+    // socket listener renders the server echo — same as file attachments.
   } catch (e) {
     addBubble(`Failed to send GIF: ${e.message}`, 'system');
   }
@@ -1021,7 +732,6 @@ async function selectChannel(channelId) {
   els['peer-avatar'].style.background = '';
   els['peer-avatar'].textContent = channelIcon(ch ? ch.type : 'group');
   els['peer-name'].textContent = ch ? ch.name : channelId;
-  els['reset-session-btn'].classList.add('hidden'); // channels aren't E2EE — nothing to reset
   setStatus(socket && socket.readyState === 1 ? 'secured' : '', socket && socket.readyState === 1 ? 'Connected' : 'Connecting…');
 
   updateComposerForChannel(ch);
@@ -1056,7 +766,9 @@ function renderChannelBanner(ch) {
   const banner = document.createElement('div');
   banner.id = 'monitoring-banner';
   banner.className = 'monitoring-banner';
-  banner.textContent = 'Messages in this channel are stored and may be reviewed by LVO admins for compliance purposes.';
+  banner.textContent = ch.dm
+    ? 'Direct messages are stored and may be reviewed by LVO admins for compliance purposes.'
+    : 'Messages in this channel are stored and may be reviewed by LVO admins for compliance purposes.';
   els['chat-active'].prepend(banner);
 }
 
@@ -1236,7 +948,12 @@ els['manage-channel-close'] && els['manage-channel-close'].addEventListener('cli
 els['admin-new-channel'] && els['admin-new-channel'].addEventListener('click', openChannelModal);
 
 // ---------------------------------------------------------------------
-// chat / E2EE wiring
+// chat wiring — one plain websocket for both channels and DMs, no
+// crypto layer. A DM is handled exactly like a channel with one other
+// member: history is always fetched fresh from the server (no local
+// cache to keep in sync), and outgoing messages are echoed back by the
+// server rather than rendered optimistically, so there's a single
+// source of truth for what's actually in the conversation.
 // ---------------------------------------------------------------------
 function setStatus(state, text) {
   els['status-dot'].className = `status-dot ${state}`;
@@ -1254,192 +971,105 @@ function addBubble(text, kind) {
   els['messages'].scrollTop = els['messages'].scrollHeight;
 }
 
-// Drops the cached Double Ratchet session (and any half-finished handshake)
-// for one peer. Needed when the peer generated a brand-new E2EE identity
-// (e.g. a fresh-start login with no backup) — sendMessage() only ever
-// re-runs the X3DH handshake when this.sessions[peerId] is missing, so
-// without this the two sides are permanently stuck encrypting/decrypting
-// against identities the other side no longer has. The next message sent
-// after this fetches the peer's *current* published bundle and re-keys.
-async function resetPeerSession(peerId) {
-  if (!client) return;
-  delete client.sessions[peerId];
-  delete client.pendingHandshake[peerId];
-  await idbSet(`client:${session.user.id}`, client.export());
-  if (selectedPeerId === peerId) {
-    addBubble('Secure session reset. It will re-establish with their current keys on your next message.', 'system');
-  }
+async function loadDmMessages(peerId) {
+  const data = await api(`/dm/${encodeURIComponent(peerId)}/messages`, { token: session.token });
+  return data.messages || [];
 }
 
-async function loadHistory(peerId) {
-  const all = (await idbGet(`history:${session.user.id}`)) || {};
-  return all[peerId] || [];
-}
-async function appendHistory(peerId, entry) {
-  const all = (await idbGet(`history:${session.user.id}`)) || {};
-  all[peerId] = [...(all[peerId] || []), entry].slice(-500);
-  await idbSet(`history:${session.user.id}`, all);
+function sendDmMessage(peerId, text, attachment) {
+  if (!socket || socket.readyState !== 1) throw new Error('Not connected.');
+  const payload = { type: 'dm_send', to: peerId, text };
+  if (attachment) payload.attachment = attachment;
+  socket.send(JSON.stringify(payload));
 }
 
-async function initClient() {
-  await loadScriptOnce('sdk/e2ee-sdk.bundle.js'); // see PERFORMANCE NOTE at top of file
-  await window.E2EE.crypto.ready();
-  const storageKey = `client:${session.user.id}`;
-  let saved = await idbGet(storageKey);
+function initClient() {
+  return new Promise((resolve, reject) => {
+    socket = new WebSocket(SERVER_URL.replace(/^http/, 'ws') + '/relay');
+    let authenticated = false;
 
-  if (!saved) {
-    // No local identity on this device yet. Before ever generating a
-    // brand new one (which would leave this device unable to read any
-    // existing DM history/sessions, AND would overwrite the published
-    // key bundle other people's sessions rely on), find out whether a
-    // cross-device backup exists — and if it does, this is NOT a decision
-    // we make silently. See the E2EE IDENTITY RECOVERY note at the top
-    // of this file.
-    let backupExists = false;
-    try {
-      await api('/me/backup', { token: session.token });
-      backupExists = true;
-    } catch {
-      backupExists = false; // genuinely a first-ever device — nothing to restore
-    }
+    socket.addEventListener('open', () => {
+      socket.send(JSON.stringify({ type: 'authenticate', token: session.token, userId: session.user.id }));
+    });
 
-    if (backupExists) {
-      if (sessionPassword) {
-        // We arrived here via a fresh login or the forced first-time
-        // password change, so the real password is already in memory —
-        // restore silently, no need to interrupt with a modal.
-        const restored = await tryRestoreFromServerBackup(sessionPassword);
-        if (restored) saved = await idbGet(storageKey);
-        // If this fails (e.g. a stale backup from before a password
-        // reset), fall through to the modal below instead of silently
-        // generating a new identity.
-      }
-      if (!saved) {
-        const { startFresh } = await promptForRestoreOrFreshStart();
-        if (!startFresh) saved = await idbGet(storageKey);
-        // startFresh === true is now the ONLY way to reach client.init()
-        // below with no saved state, and it requires two explicit,
-        // confirmed choices — never a dismissed native prompt().
-      }
-    }
-    // backupExists === false: this really is a first-ever device for this
-    // account. Proceed to client.init() below, unchanged from before.
-  }
+    socket.addEventListener('close', () => {
+      setStatus('error', 'Disconnected');
+      if (!authenticated) reject(new Error('Connection closed before authenticating.'));
+    });
 
-  const transportBundle = window.E2EE.createBrowserTransport({
-    serverUrl: SERVER_URL,
-    userId: session.user.id,
-    authToken: session.token,
-    onOpen: () => setStatus('secured', 'Connected'),
-    onMessage: async (wire) => {
+    socket.addEventListener('error', () => {
+      if (!authenticated) reject(new Error('Could not connect to the chat server.'));
+    });
+
+    socket.addEventListener('message', (ev) => {
+      let payload;
       try {
-        await client.receive(wire);
-      } catch (e) {
-        console.error('Failed to decrypt incoming message', e);
-        if (wire.from === selectedPeerId) addBubble('Received a message that could not be decrypted.', 'system');
+        payload = JSON.parse(ev.data);
+      } catch {
+        return;
       }
-    },
-  });
-  socket = transportBundle.socket;
-  socket.addEventListener('close', () => setStatus('error', 'Disconnected'));
 
-  // Second listener on the same socket, scoped to channel broadcasts
-  // (room_message / room_error). Does not interfere with the SDK's own
-  // listener for encrypted 1:1 traffic — it ignores anything else.
-  socket.addEventListener('message', (ev) => {
-    let payload;
-    try {
-      payload = JSON.parse(ev.data);
-    } catch {
-      return; // not JSON (e.g. raw E2EE wire frame) — not ours to handle
-    }
-    if (payload.type === 'room_message') {
-      if (selectedChannelId === payload.channelId) {
-        renderMessage(
-          { id: payload.id, from: payload.from, fromName: payload.fromName, text: payload.text, attachment: payload.attachment, reactions: {}, ts: payload.ts },
-          payload.from === session.user.id ? 'mine' : 'theirs',
-          payload.channelId,
-          true
-        );
+      if (payload.type === 'authenticated') {
+        authenticated = true;
+        setStatus('secured', 'Connected');
+        resolve();
+        return;
       }
-      return;
-    }
-    if (payload.type === 'room_reaction') {
-      const store = channelMessageEls[payload.channelId];
-      const entry = store && store.get(payload.messageId);
-      if (entry) {
-        const reactions = entry.reactions;
-        if (payload.action === 'add') {
-          if (!reactions[payload.emoji]) reactions[payload.emoji] = [];
-          if (!reactions[payload.emoji].includes(payload.from)) reactions[payload.emoji].push(payload.from);
-        } else {
-          if (reactions[payload.emoji]) {
-            reactions[payload.emoji] = reactions[payload.emoji].filter((u) => u !== payload.from);
-            if (reactions[payload.emoji].length === 0) delete reactions[payload.emoji];
-          }
+      if (payload.type === 'auth_error') {
+        setStatus('error', 'Disconnected');
+        reject(new Error(payload.error || 'Authentication failed.'));
+        return;
+      }
+
+      if (payload.type === 'dm_message') {
+        const otherParty = payload.from === session.user.id ? payload.to : payload.from;
+        if (selectedPeerId === otherParty) {
+          renderMessage(
+            { id: payload.id, from: payload.from, text: payload.text, attachment: payload.attachment, reactions: {}, ts: payload.ts },
+            payload.from === session.user.id ? 'mine' : 'theirs',
+            otherParty,
+            false
+          );
         }
-        renderReactionsInto(entry.el.querySelector('.message-reactions'), reactions, payload.channelId, payload.messageId);
+        return;
       }
-      return;
-    }
-    if (payload.type === 'room_error') {
-      if (selectedChannelId === payload.channelId) {
-        els['composer-error'].textContent = payload.error;
+      if (payload.type === 'room_message') {
+        if (selectedChannelId === payload.channelId) {
+          renderMessage(
+            { id: payload.id, from: payload.from, fromName: payload.fromName, text: payload.text, attachment: payload.attachment, reactions: {}, ts: payload.ts },
+            payload.from === session.user.id ? 'mine' : 'theirs',
+            payload.channelId,
+            true
+          );
+        }
+        return;
       }
-      return;
-    }
+      if (payload.type === 'room_reaction') {
+        const store = channelMessageEls[payload.channelId];
+        const entry = store && store.get(payload.messageId);
+        if (entry) {
+          const reactions = entry.reactions;
+          if (payload.action === 'add') {
+            if (!reactions[payload.emoji]) reactions[payload.emoji] = [];
+            if (!reactions[payload.emoji].includes(payload.from)) reactions[payload.emoji].push(payload.from);
+          } else {
+            if (reactions[payload.emoji]) {
+              reactions[payload.emoji] = reactions[payload.emoji].filter((u) => u !== payload.from);
+              if (reactions[payload.emoji].length === 0) delete reactions[payload.emoji];
+            }
+          }
+          renderReactionsInto(entry.el.querySelector('.message-reactions'), reactions, payload.channelId, payload.messageId);
+        }
+        return;
+      }
+      if (payload.type === 'room_error') {
+        if (selectedChannelId === payload.channelId) {
+          els['composer-error'].textContent = payload.error;
+        }
+        return;
+      }
+    });
   });
-
-  client = new window.E2EE.E2EEClient(session.user.id, transportBundle.transport);
-  client.onMessage = async (from, text) => {
-    const ts = Date.now();
-    await appendHistory(from, { from, text, ts });
-    if (from === selectedPeerId) renderDmHistoryEntry({ from, text, ts });
-    await idbSet(storageKey, client.export());
-    scheduleBackupPush();
-  };
-
-  if (saved) {
-    await client.restore(saved);
-  } else {
-    await client.init(); // reached only for a true first device, or an explicit "start fresh" choice
-  }
-  await idbSet(storageKey, client.export());
-  scheduleBackupPush(); // make sure a backup exists even before the first message is sent/received
-}
-
-// A DM "message" from the wire is either plain chat text, or a JSON
-// attachment descriptor (see uploadDmFile / sendCurrentMessage / sendGif)
-// — this tells the two apart and renders whichever it is.
-function renderDmHistoryEntry(entry) {
-  const kind = entry.from === session.user.id ? 'mine' : 'theirs';
-  const descriptor = isAttachmentDescriptor(entry.text);
-  if (descriptor) {
-    renderMessage(
-      {
-        id: `${entry.ts}-${entry.from}`,
-        from: entry.from,
-        text: '',
-        attachment: descriptor.gifUrl
-          ? { gifUrl: descriptor.gifUrl, filename: descriptor.filename, mime: descriptor.mime }
-          : {
-              storageKey: descriptor.storageKey,
-              filename: descriptor.filename,
-              mime: descriptor.mime,
-              size: descriptor.size,
-              cryptoKey: descriptor.cryptoKey,
-              iv: descriptor.iv,
-            },
-        reactions: {},
-        ts: entry.ts,
-      },
-      kind,
-      selectedPeerId,
-      false
-    );
-  } else {
-    renderMessage({ id: `${entry.ts}-${entry.from}`, from: entry.from, text: entry.text, reactions: {}, ts: entry.ts }, kind, selectedPeerId, false);
-  }
 }
 
 async function selectPeer(peerId) {
@@ -1454,19 +1084,23 @@ async function selectPeer(peerId) {
   els['chat-active'].classList.remove('hidden');
   renderAvatar(els['peer-avatar'], member.id, member.avatar, member.displayName);
   els['peer-name'].textContent = member.displayName;
-  els['reset-session-btn'].classList.remove('hidden');
   setStatus(socket && socket.readyState === 1 ? 'secured' : '', socket && socket.readyState === 1 ? 'Connected' : 'Connecting…');
 
   updateComposerForChannel(null);
-  renderChannelBanner(null);
+  renderChannelBanner({ name: member.displayName, dm: true });
 
   els['messages'].innerHTML = '';
-  const history = await loadHistory(peerId);
+  let history = [];
+  try {
+    history = await loadDmMessages(peerId);
+  } catch (e) {
+    addBubble(`Could not load conversation history: ${e.message}`, 'system');
+  }
   if (history.length === 0) {
-    addBubble('No messages yet. Anything you send here is end-to-end encrypted.', 'system');
+    addBubble(`No messages yet with ${member.displayName}.`, 'system');
   }
   for (const entry of history) {
-    renderDmHistoryEntry(entry);
+    renderMessage(entry, entry.from === session.user.id ? 'mine' : 'theirs', peerId, false);
   }
 }
 
@@ -1482,58 +1116,26 @@ async function sendCurrentMessage() {
   els['composer-send'].disabled = true;
   els['composer-error'].textContent = '';
   try {
-    if (selectedChannelId) {
-      // channel_messages.attachment_json holds exactly one attachment per
-      // row, so each file goes out as its own message; any typed text
-      // rides along on the last one.
-      if (files.length > 0) {
-        for (let i = 0; i < files.length; i++) {
-          const uploaded = await uploadChannelFile(selectedChannelId, files[i]);
-          sendChannelMessage(selectedChannelId, i === files.length - 1 ? text : '', uploaded);
-        }
-      } else {
-        sendChannelMessage(selectedChannelId, text);
+    // Exactly one attachment per outgoing message either way, so multiple
+    // files go out as separate sends; any typed text rides along on the
+    // last one. Nothing is rendered locally — the server echoes every
+    // dm_message/room_message back to the sender too, and the socket
+    // listener above renders it. Rendering it here as well caused
+    // duplicates.
+    const send = selectedChannelId
+      ? (t, attachment) => sendChannelMessage(selectedChannelId, t, attachment)
+      : (t, attachment) => sendDmMessage(selectedPeerId, t, attachment);
+    const upload = selectedChannelId
+      ? (file) => uploadChannelFile(selectedChannelId, file)
+      : (file) => uploadDmFile(selectedPeerId, file);
+
+    if (files.length > 0) {
+      for (let i = 0; i < files.length; i++) {
+        const uploaded = await upload(files[i]);
+        send(i === files.length - 1 ? text : '', uploaded);
       }
-      // Do not render here: the server echoes every room_message back to
-      // all channel members (including the sender), and the socket listener
-      // already renders it. Rendering it here too caused duplicates.
-    } else if (files.length > 0) {
-      for (const file of files) {
-        const uploaded = await uploadDmFile(selectedPeerId, file);
-        const descriptor = {
-          __lvoAttachment: true,
-          storageKey: uploaded.storageKey,
-          filename: uploaded.filename,
-          mime: uploaded.mime,
-          size: uploaded.size,
-          cryptoKey: uploaded.rawKeyB64,
-          iv: uploaded.ivB64,
-        };
-        await client.sendMessage(selectedPeerId, JSON.stringify(descriptor));
-        const ts = Date.now();
-        renderMessage(
-          { id: `local-${ts}-${Math.random()}`, from: session.user.id, text: '', attachment: { filename: uploaded.filename, mime: uploaded.mime, size: uploaded.size, localUrl: URL.createObjectURL(file) }, reactions: {}, ts },
-          'mine',
-          selectedPeerId,
-          false
-        );
-        await appendHistory(selectedPeerId, { from: session.user.id, text: JSON.stringify(descriptor), ts });
-      }
-      if (text) {
-        await client.sendMessage(selectedPeerId, text);
-        const ts = Date.now();
-        renderMessage({ id: `local-${ts}`, from: session.user.id, text, reactions: {}, ts }, 'mine', selectedPeerId, false);
-        await appendHistory(selectedPeerId, { from: session.user.id, text, ts });
-      }
-      await idbSet(`client:${session.user.id}`, client.export());
-      scheduleBackupPush();
     } else {
-      await client.sendMessage(selectedPeerId, text);
-      const ts = Date.now();
-      renderMessage({ id: `local-${ts}`, from: session.user.id, text, reactions: {}, ts }, 'mine', selectedPeerId, false);
-      await appendHistory(selectedPeerId, { from: session.user.id, text, ts });
-      await idbSet(`client:${session.user.id}`, client.export());
-      scheduleBackupPush();
+      send(text);
     }
   } catch (e) {
     console.error(e);
@@ -1866,10 +1468,6 @@ els['login-form'].addEventListener('submit', async (e) => {
     });
     session = data;
     saveSession(session);
-    // Kept in memory only (never localStorage/IndexedDB) so this device can
-    // restore a cross-device backup if it has no local history yet, and so
-    // it can push its own backup as this session goes on. See initClient().
-    sessionPassword = typedPassword;
     await boot();
   } catch (e) {
     els['login-error'].textContent = e.message;
@@ -1890,7 +1488,6 @@ els['pwd-save'].addEventListener('click', async () => {
     await api('/me/password', { method: 'POST', token: session.token, body: { newPassword } });
     session.user.mustChangePassword = false;
     saveSession(session);
-    sessionPassword = newPassword; // this device now holds the account's real password — good for backup restore/push
     els['pwd-modal'].classList.add('hidden');
     await loadRoster();
     showApp();
@@ -1912,18 +1509,10 @@ els['composer-input'].addEventListener('keydown', (e) => {
 els['composer-input'].addEventListener('input', updateSendButtonState);
 
 // ---- logout ----
-els['reset-session-btn'].addEventListener('click', () => {
-  if (!selectedPeerId) return;
-  const member = roster.find((m) => m.id === selectedPeerId);
-  const ok = confirm(`Reset the secure session with ${member ? member.displayName : selectedPeerId}? Do this if messages aren't decrypting — it will re-establish encryption using their current keys.`);
-  if (ok) resetPeerSession(selectedPeerId);
-});
 els['logout-btn'].addEventListener('click', () => {
   if (socket) socket.close();
   clearSession();
   session = null;
-  client = null;
-  sessionPassword = null;
   location.reload();
 });
 
