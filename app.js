@@ -1098,16 +1098,41 @@ els['gif-cancel'] && els['gif-cancel'].addEventListener('click', () => els['gif-
 els['composer-gif-btn'] && els['composer-gif-btn'].addEventListener('click', openGifModal);
 
 async function sendGif({ url, title }) {
-  els['gif-modal'].classList.add('hidden');
-  const attachment = { gifUrl: url, filename: title || 'GIF', mime: 'image/gif' };
+  if (!selectedChannelId && !selectedPeerId) {
+    els['gif-modal'].classList.add('hidden');
+    return;
+  }
+  els['gif-error'].textContent = '';
+  const choices = els['gif-grid'].querySelectorAll('.gif-choice');
+  choices.forEach((b) => { b.disabled = true; });
   try {
+    // Route the GIF through the same upload pipeline regular attachments
+    // use (fetch the bytes, POST to /upload, send the returned key) rather
+    // than sending an ad-hoc { gifUrl } attachment straight over the
+    // socket — that shape isn't produced anywhere else in the app, so if
+    // the server only validates attachments coming out of /upload, a raw
+    // gifUrl message can get silently dropped. This way a sent GIF is
+    // indistinguishable, server-side, from any other image attachment.
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('Could not download that GIF.');
+    const blob = await res.blob();
+    const safeName = (title || 'gif').replace(/[^a-z0-9-_]+/gi, '_').slice(0, 60) || 'gif';
+    const file = new File([blob], `${safeName}.gif`, { type: blob.type || 'image/gif' });
+
+    const uploaded = selectedChannelId
+      ? await uploadChannelFile(selectedChannelId, file)
+      : await uploadDmFile(selectedPeerId, file);
+
+    els['gif-modal'].classList.add('hidden');
     if (selectedChannelId) {
-      sendChannelMessage(selectedChannelId, '', attachment);
-    } else if (selectedPeerId) {
-      sendDmMessage(selectedPeerId, '', attachment);
+      sendChannelMessage(selectedChannelId, '', uploaded);
+    } else {
+      sendDmMessage(selectedPeerId, '', uploaded);
     }
   } catch (e) {
-    addBubble(`Failed to send GIF: ${e.message}`, 'system');
+    els['gif-error'].textContent = `Failed to send GIF: ${e.message}`;
+  } finally {
+    choices.forEach((b) => { b.disabled = false; });
   }
 }
 
@@ -1874,6 +1899,7 @@ async function sendCurrentMessage() {
   if (!selectedPeerId && !selectedChannelId) return;
 
   els['composer-input'].value = '';
+  autosizeComposer();
   clearPendingFiles();
   updateSendButtonState();
   els['composer-send'].disabled = true;
@@ -2295,6 +2321,12 @@ els['pwd-save'].addEventListener('click', async () => {
 });
 
 // ---- composer ----
+const COMPOSER_MAX_HEIGHT = 140; // px — matches app.css .composer-pill textarea max-height
+function autosizeComposer() {
+  const el = els['composer-input'];
+  el.style.height = 'auto';
+  el.style.height = `${Math.min(el.scrollHeight, COMPOSER_MAX_HEIGHT)}px`;
+}
 els['composer-send'].addEventListener('click', sendCurrentMessage);
 els['composer-input'].addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) {
@@ -2302,7 +2334,10 @@ els['composer-input'].addEventListener('keydown', (e) => {
     sendCurrentMessage();
   }
 });
-els['composer-input'].addEventListener('input', updateSendButtonState);
+els['composer-input'].addEventListener('input', () => {
+  updateSendButtonState();
+  autosizeComposer();
+});
 
 // ---- logout ----
 els['logout-btn'].addEventListener('click', () => {
