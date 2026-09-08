@@ -5,7 +5,7 @@
  * selected member or channel, all over one websocket to the relay
  * Worker. There is no client-side encryption anywhere in this file —
  * direct messages and channel messages are both plaintext, both
- * persisted server-side (Supabase), and both visible to admins for
+ * persisted server-side (D1), and both visible to admins for
  * oversight. Same trust tier, same code path (renderMessage etc. is
  * shared between the two) — a DM is just a channel with exactly one
  * other member.
@@ -22,6 +22,26 @@
  * the chat header removes it again. This is a no-op above the
  * breakpoint since the desktop grid always shows both panes regardless
  * of the class.
+ *
+ * PEOPLE SEARCH (NEW): the member roster is no longer an always-on
+ * directory. #roster-list stays empty/hidden until the person types
+ * into #roster-search-input — same idea as Microsoft Teams' people
+ * search, instead of a static list everyone scrolls through.
+ *
+ * MUTE (NEW, server-synced): muted conversations are stored on the
+ * server (muted_conversations table via /me/muted), keyed only by
+ * (user, conversation) — not by device or browser — so muting a DM or
+ * channel applies everywhere that account signs in. mutedConvos below
+ * is just an in-memory cache of what the server returned at boot,
+ * refreshed optimistically on every toggle.
+ *
+ * TRANSLATE (NEW): a "Translate" hover action on every message bubble.
+ * Uses the free, keyless Google Translate web endpoint
+ * (translate.googleapis.com/translate_a/single) — this is the same
+ * unofficial endpoint many open-source projects use; it has no SLA and
+ * can be rate-limited or changed by Google without notice. Swap
+ * translateText() below for a paid/official API (Google Cloud
+ * Translation, DeepL, etc.) if this needs to be production-grade.
  *
  * PERFORMANCE NOTE: the emoji-picker-element web component is loaded
  * lazily (see ensureEmojiPicker below) instead of via a <script> tag in
@@ -121,6 +141,61 @@ let reactionPickerCtx = null; // { channelId, messageId } the picker popup is cu
 const fileBlobCache = new Map(); // storageKey -> object URL, for plaintext attachments
 let gifSearchDebounce = null; // debounce handle for the GIF search box
 
+// Muted conversations (NEW) — server-synced. Populated from GET
+// /me/muted at boot; each toggle updates this cache immediately (so the
+// UI responds instantly) and also fires the POST that persists it.
+// Keys look like "channel:<id>" or "dm:<id>".
+let mutedConvos = new Set();
+function convKey(id, isChannel) {
+  return (isChannel ? 'channel:' : 'dm:') + id;
+}
+async function loadMutedConvos() {
+  try {
+    const data = await api('/me/muted', { token: session.token });
+    mutedConvos = new Set((data.muted || []).map((m) => convKey(m.id, m.type === 'channel')));
+  } catch {
+    mutedConvos = new Set(); // fail open — better to over-notify than silently lose messages
+  }
+}
+async function setMuted(id, isChannel, muted) {
+  const key = convKey(id, isChannel);
+  if (muted) mutedConvos.add(key); else mutedConvos.delete(key);
+  updateMuteButton(id, isChannel); // optimistic UI update before the network call resolves
+  try {
+    await api('/me/muted', {
+      method: 'POST',
+      token: session.token,
+      body: { type: isChannel ? 'channel' : 'dm', id, muted },
+    });
+  } catch (e) {
+    // roll back on failure so the UI doesn't lie about what's actually saved
+    if (muted) mutedConvos.delete(key); else mutedConvos.add(key);
+    updateMuteButton(id, isChannel);
+    console.error('Failed to update mute state:', e.message);
+  }
+}
+function updateMuteButton(id, isChannel) {
+  if (!els['mute-btn']) return;
+  const muted = mutedConvos.has(convKey(id, isChannel));
+  els['mute-btn'].textContent = muted ? '🔕' : '🔔';
+  els['mute-btn'].title = muted ? 'Unmute notifications' : 'Mute notifications';
+  els['mute-btn'].dataset.convId = id;
+  els['mute-btn'].dataset.isChannel = isChannel ? '1' : '';
+}
+function notifyIncoming(id, isChannel, title, body) {
+  if (mutedConvos.has(convKey(id, isChannel))) return;
+  const isOpenAndFocused = document.hasFocus()
+    && ((isChannel && selectedChannelId === id) || (!isChannel && selectedPeerId === id));
+  if (isOpenAndFocused) return;
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  try {
+    new Notification(title, { body, icon: 'assets/logo.png' });
+  } catch {
+    // Notification constructor can throw on some mobile browsers — never
+    // let a notification failure break message rendering.
+  }
+}
+
 // How close together (ms) two consecutive messages from the same sender
 // need to be to visually "group" them (hide the repeat avatar/name),
 // Instagram-DM style, instead of every message getting its own header.
@@ -131,9 +206,10 @@ const els = {};
   'login-screen', 'login-form', 'login-username', 'login-password', 'login-submit', 'login-error',
   'pwd-modal', 'pwd-new', 'pwd-error', 'pwd-save',
   'app-screen', 'rail', 'chat-pane', 'me-avatar', 'me-name', 'leader-badge', 'open-avatar-modal',
-  'channels-list', 'roster-list', 'admin-link', 'logout-btn',
+  'channels-list', 'roster-list', 'roster-search-input', 'admin-link', 'logout-btn',
   'settings-btn', 'settings-popover', 'settings-avatar-btn',
   'chat-empty', 'chat-active', 'chat-back-btn', 'peer-avatar', 'peer-name', 'status-dot', 'status-text',
+  'mute-btn',
   'messages', 'composer-input', 'composer-send', 'composer-row', 'composer-error', 'composer-locked',
   'composer-file-input', 'composer-attach-btn', 'attachment-preview',
   'composer-gif-btn', 'gif-modal', 'gif-search-input', 'gif-grid', 'gif-error', 'gif-cancel',
@@ -553,6 +629,52 @@ emojiPickerEl && emojiPickerEl.addEventListener('emoji-click', (e) => {
 });
 
 // ---------------------------------------------------------------------
+// translate (NEW) — see TRANSLATE note at top of file for the caveat
+// about this being a free/keyless endpoint, not an official API.
+// ---------------------------------------------------------------------
+async function translateText(text, targetLang) {
+  const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(targetLang)}&dt=t&q=${encodeURIComponent(text)}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('Translation service unavailable.');
+  const data = await res.json();
+  // Response shape: [[[translatedChunk, originalChunk, ...], ...], ...]
+  return (data[0] || []).map((chunk) => chunk[0]).join('');
+}
+
+function targetLanguage() {
+  return (navigator.language || 'en').split('-')[0];
+}
+
+async function toggleTranslate(node, originalText, translateBtn) {
+  const existing = node.querySelector('.message-translation');
+  if (existing) {
+    existing.remove();
+    translateBtn.textContent = '🌐';
+    translateBtn.title = 'Translate';
+    return;
+  }
+  translateBtn.textContent = '…';
+  translateBtn.disabled = true;
+  try {
+    const translated = await translateText(originalText, targetLanguage());
+    const box = document.createElement('div');
+    box.className = 'message-translation';
+    box.textContent = translated;
+    const bubbleWrap = node.querySelector('.message-bubble');
+    bubbleWrap.appendChild(box);
+    translateBtn.textContent = '↺';
+    translateBtn.title = 'Show original';
+  } catch (e) {
+    const box = document.createElement('div');
+    box.className = 'message-translation error';
+    box.textContent = `Couldn't translate: ${e.message}`;
+    node.querySelector('.message-bubble').appendChild(box);
+  } finally {
+    translateBtn.disabled = false;
+  }
+}
+
+// ---------------------------------------------------------------------
 // message rendering (Telegram/Instagram-style bubble: avatar, author,
 // text, attachments, reaction pills, hover-to-react, and consecutive
 // messages from the same sender grouped together with the repeat
@@ -586,6 +708,7 @@ function renderMessage(msg, kind, scopeId, isChannel) {
   const reactionsEl = node.querySelector('.message-reactions');
   const reactBtn = node.querySelector('.message-react-btn');
   const heartBtn = node.querySelector('.message-heart-btn');
+  const translateBtn = node.querySelector('.message-translate-btn');
 
   if (kind === 'mine') {
     renderAvatar(avatarEl, session.user.id, session.user.avatar, session.user.displayName);
@@ -599,8 +722,15 @@ function renderMessage(msg, kind, scopeId, isChannel) {
 
   if (msg.text) {
     textEl.textContent = msg.text;
+    if (translateBtn) {
+      translateBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleTranslate(node, msg.text, translateBtn);
+      });
+    }
   } else {
     textEl.classList.add('hidden');
+    if (translateBtn) translateBtn.remove(); // nothing to translate on an attachment-only message
   }
 
   if (msg.attachment) renderAttachmentInto(attachmentsEl, msg.attachment, isChannel);
@@ -634,7 +764,7 @@ function renderMessage(msg, kind, scopeId, isChannel) {
 }
 
 // ---------------------------------------------------------------------
-// roster
+// roster — search-first (see PEOPLE SEARCH note at top of file)
 // ---------------------------------------------------------------------
 async function loadRoster() {
   const data = await api('/roster', { token: session.token });
@@ -645,15 +775,22 @@ async function loadRoster() {
 }
 
 function renderRoster() {
+  const query = (els['roster-search-input'] && els['roster-search-input'].value.trim().toLowerCase()) || '';
   els['roster-list'].innerHTML = '';
-  if (roster.length === 0) {
+  els['roster-list'].classList.toggle('hidden', query.length === 0);
+  if (query.length === 0) return;
+
+  const matches = roster.filter(
+    (m) => m.displayName.toLowerCase().includes(query) || m.id.toLowerCase().includes(query)
+  );
+  if (matches.length === 0) {
     const empty = document.createElement('p');
     empty.className = 'roster-empty';
-    empty.textContent = 'No other members yet. Ask your admin to add someone.';
+    empty.textContent = 'No members match that search.';
     els['roster-list'].appendChild(empty);
     return;
   }
-  for (const member of roster) {
+  for (const member of matches) {
     const btn = document.createElement('button');
     btn.className = 'roster-item' + (member.id === selectedPeerId && !selectedChannelId ? ' active' : '');
     const avatarEl = document.createElement('div');
@@ -664,10 +801,15 @@ function renderRoster() {
     name.textContent = member.displayName;
     btn.appendChild(avatarEl);
     btn.appendChild(name);
-    btn.addEventListener('click', () => selectPeer(member.id));
+    btn.addEventListener('click', () => {
+      selectPeer(member.id);
+      els['roster-search-input'].value = '';
+      renderRoster();
+    });
     els['roster-list'].appendChild(btn);
   }
 }
+els['roster-search-input'] && els['roster-search-input'].addEventListener('input', renderRoster);
 
 // ---------------------------------------------------------------------
 // channels (General / Group / Announcement — plaintext, server-stored)
@@ -702,6 +844,12 @@ function renderChannels() {
       lock.textContent = 'read-only';
       btn.appendChild(lock);
     }
+    if (mutedConvos.has(convKey(ch.id, true))) {
+      const muteMark = document.createElement('span');
+      muteMark.className = 'muted-badge';
+      muteMark.textContent = '🔕';
+      btn.appendChild(muteMark);
+    }
     btn.addEventListener('click', () => selectChannel(ch.id));
     els['channels-list'].appendChild(btn);
   }
@@ -720,6 +868,7 @@ async function selectChannel(channelId) {
   renderRoster();
   renderChannels();
   openChatPaneMobile();
+  updateMuteButton(channelId, true);
 
   const ch = channels.find((c) => c.id === channelId);
   els['chat-empty'].classList.add('hidden');
@@ -945,6 +1094,20 @@ els['manage-channel-close'] && els['manage-channel-close'].addEventListener('cli
 els['admin-new-channel'] && els['admin-new-channel'].addEventListener('click', openChannelModal);
 
 // ---------------------------------------------------------------------
+// mute button (NEW) — lives in the chat header, toggles the currently
+// open conversation. See setMuted()/mutedConvos for the server-synced
+// state this reads and writes.
+// ---------------------------------------------------------------------
+els['mute-btn'] && els['mute-btn'].addEventListener('click', () => {
+  const id = els['mute-btn'].dataset.convId;
+  const isChannel = !!els['mute-btn'].dataset.isChannel;
+  if (!id) return;
+  const currentlyMuted = mutedConvos.has(convKey(id, isChannel));
+  setMuted(id, isChannel, !currentlyMuted);
+  if (isChannel) renderChannels(); // refresh the 🔕 badge in the channel list
+});
+
+// ---------------------------------------------------------------------
 // chat wiring — one plain websocket for both channels and DMs, no
 // crypto layer. A DM is handled exactly like a channel with one other
 // member: history is always fetched fresh from the server (no local
@@ -1028,6 +1191,10 @@ function initClient() {
             false
           );
         }
+        if (payload.from !== session.user.id) {
+          const fromMember = roster.find((m) => m.id === payload.from);
+          notifyIncoming(otherParty, false, fromMember ? fromMember.displayName : payload.from, payload.text || 'Sent an attachment');
+        }
         return;
       }
       if (payload.type === 'room_message') {
@@ -1038,6 +1205,10 @@ function initClient() {
             payload.channelId,
             true
           );
+        }
+        if (payload.from !== session.user.id) {
+          const ch = channels.find((c) => c.id === payload.channelId);
+          notifyIncoming(payload.channelId, true, `${ch ? ch.name : payload.channelId}: ${payload.fromName || payload.from}`, payload.text || 'Sent an attachment');
         }
         return;
       }
@@ -1076,6 +1247,7 @@ async function selectPeer(peerId) {
   renderRoster();
   renderChannels();
   openChatPaneMobile();
+  updateMuteButton(peerId, false);
   const member = roster.find((m) => m.id === peerId);
   els['chat-empty'].classList.add('hidden');
   els['chat-active'].classList.remove('hidden');
@@ -1351,9 +1523,6 @@ async function refreshAdminChannelList() {
 // that returns DM history for any two userIds when called by an admin
 // (not just when the caller is one of the two participants) — see the
 // GET /admin/dm/:userAId/:userBId/messages call in openAdminDmViewer.
-// That endpoint is not present in the Worker code we've seen; add it
-// there, gated on session.user.role === 'admin', returning the same
-// message shape as /dm/:peerId/messages.
 async function refreshDmThreads() {
   const { threads } = await api('/admin/dm-threads', { token: session.token });
   els['dm-thread-list'].innerHTML = '';
@@ -1382,9 +1551,7 @@ async function refreshDmThreads() {
 // ADMIN DM VIEWER — read-only look at a DM thread between two other
 // members. Reuses renderMessage so it looks identical to a normal DM
 // (Instagram/Telegram bubble style), just rendered into a modal with
-// the composer hidden. Requires the /admin/dm/:userAId/:userBId/messages
-// endpoint described above; the markup it targets is added to
-// index.html alongside this file.
+// the composer hidden.
 // ---------------------------------------------------------------------
 async function openAdminDmViewer(userA, userB) {
   const modal = document.getElementById('admin-dm-viewer-modal');
@@ -1478,6 +1645,11 @@ function showApp() {
   // screen, so it's already warm the first time someone opens a
   // reaction picker instead of them waiting on it mid-interaction.
   ensureEmojiPicker().catch(() => {});
+  // Ask for notification permission right after login rather than on
+  // page load, so the browser's permission prompt has context.
+  if ('Notification' in window && Notification.permission === 'default') {
+    Notification.requestPermission();
+  }
 }
 
 async function boot() {
@@ -1504,6 +1676,7 @@ async function boot() {
   // preset-type avatar. Rendering before this resolved was causing the
   // avatar to silently fall back to the letter-avatar look on every load.
   await loadRoster();
+  await loadMutedConvos(); // must resolve before loadChannels()/renderChannels() draw the 🔕 badges
   showApp();
   await loadChannels();
   await initClient();
@@ -1544,6 +1717,7 @@ els['pwd-save'].addEventListener('click', async () => {
     saveSession(session);
     els['pwd-modal'].classList.add('hidden');
     await loadRoster();
+    await loadMutedConvos();
     showApp();
     await loadChannels();
     await initClient();
