@@ -10,6 +10,154 @@
 <link rel="stylesheet" href="app.css" />
 <link rel="icon" type="image/png" href="assets/logo.png"/>
 <link rel="apple-touch-icon" href="assets/logo.png"/>
+
+<!--
+  TEAMS-STYLE ADDITIONS (new).
+  This block is self-contained so it works even before app.css picks up
+  matching rules — it only defines classes that didn't exist before
+  (top-tabs, search, calendar, news). It reuses your existing CSS
+  variables (--panel-raised, etc.) where they're already relied on
+  elsewhere in the app, and falls back sanely if they're undefined.
+-->
+<style>
+  :root{
+    --teams-accent: var(--accent, #5b5fc7);
+    --teams-accent-hover: var(--accent-hover, #4649a8);
+    --teams-border: var(--border, rgba(127,127,127,.18));
+    --teams-surface: var(--panel-raised, #1e1f26);
+  }
+
+  /* ---- top tab row (Chat / Calendar / News), Teams left-rail style ---- */
+  .top-tabs{
+    display:flex;
+    gap:4px;
+    padding:8px 10px 4px;
+    border-bottom:1px solid var(--teams-border);
+  }
+  .top-tab{
+    flex:1;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    gap:2px;
+    padding:7px 4px;
+    border:none;
+    background:transparent;
+    border-radius:8px;
+    cursor:pointer;
+    font-family:inherit;
+    font-size:11px;
+    color:inherit;
+    opacity:.65;
+  }
+  .top-tab .top-tab-icon{ font-size:16px; line-height:1; }
+  .top-tab:hover{ opacity:.9; background:rgba(127,127,127,.08); }
+  .top-tab.active{ opacity:1; background:rgba(91,95,199,.14); color:var(--teams-accent); box-shadow:inset 0 0 0 1px rgba(91,95,199,.35); }
+
+  /* ---- global search (Teams "Search or type a command") ---- */
+  .global-search{ position:relative; padding:8px 10px; }
+  .global-search input{
+    width:100%;
+    box-sizing:border-box;
+    padding:8px 10px 8px 30px;
+    border-radius:6px;
+    border:1px solid var(--teams-border);
+    background:rgba(127,127,127,.08);
+    color:inherit;
+    font-family:inherit;
+    font-size:13px;
+  }
+  .global-search::before{
+    content:"🔍";
+    position:absolute;
+    left:19px; top:17px;
+    font-size:12px;
+    opacity:.6;
+    pointer-events:none;
+  }
+  .search-results{
+    position:absolute;
+    left:10px; right:10px; top:100%;
+    z-index:40;
+    background:var(--teams-surface);
+    border:1px solid var(--teams-border);
+    border-radius:8px;
+    box-shadow:0 8px 24px rgba(0,0,0,.35);
+    max-height:70vh;
+    overflow-y:auto;
+    padding:6px 0;
+  }
+  .search-results.hidden{ display:none; }
+  .search-section-label{
+    font-size:10.5px; letter-spacing:.06em; text-transform:uppercase;
+    opacity:.55; padding:8px 12px 4px;
+  }
+  .search-result-row{
+    display:flex; align-items:center; gap:8px;
+    width:100%; text-align:left;
+    padding:7px 12px;
+    border:none; background:transparent; color:inherit;
+    font-family:inherit; font-size:13px; cursor:pointer;
+  }
+  .search-result-row:hover{ background:rgba(127,127,127,.1); }
+  .search-result-sub{ opacity:.6; font-size:11.5px; margin-left:auto; padding-left:8px; white-space:nowrap; }
+  .search-empty{ padding:10px 12px; opacity:.6; font-size:12.5px; }
+
+  /* ---- shared full-pane view (Calendar / News sit where chat sits) ---- */
+  .full-view{ padding:22px 26px; overflow-y:auto; height:100%; box-sizing:border-box; }
+  .full-view-header{
+    display:flex; align-items:center; justify-content:space-between;
+    margin-bottom:16px; gap:12px; flex-wrap:wrap;
+  }
+  .full-view-header h1{ font-family:'Fraunces', serif; font-size:22px; margin:0; }
+
+  /* ---- calendar ---- */
+  .cal-nav{ display:flex; align-items:center; gap:10px; }
+  .cal-nav button{ background:transparent; border:1px solid var(--teams-border); border-radius:6px; color:inherit; cursor:pointer; padding:4px 9px; }
+  .cal-month-label{ font-weight:600; min-width:150px; text-align:center; }
+  .calendar-grid{
+    display:grid; grid-template-columns:repeat(7,1fr); gap:6px; margin-bottom:20px;
+  }
+  .calendar-dow{ text-align:center; font-size:11px; opacity:.55; padding-bottom:4px; text-transform:uppercase; letter-spacing:.05em; }
+  .calendar-day{
+    min-height:78px; border:1px solid var(--teams-border); border-radius:8px;
+    padding:6px; font-size:12px; cursor:pointer; position:relative;
+    display:flex; flex-direction:column; gap:3px;
+  }
+  .calendar-day.other-month{ opacity:.35; }
+  .calendar-day.today{ box-shadow:inset 0 0 0 2px var(--teams-accent); }
+  .calendar-day.selected{ background:rgba(91,95,199,.14); }
+  .calendar-day .day-num{ font-weight:600; }
+  .calendar-day .day-dot-row{ display:flex; gap:3px; flex-wrap:wrap; }
+  .calendar-day .day-dot{ width:6px; height:6px; border-radius:50%; background:var(--teams-accent); }
+  .day-events-panel{ border-top:1px solid var(--teams-border); padding-top:14px; }
+  .event-item{
+    display:flex; gap:10px; align-items:flex-start;
+    padding:10px 12px; border:1px solid var(--teams-border); border-radius:8px; margin-bottom:8px;
+  }
+  .event-time{ font-family:'IBM Plex Mono', monospace; font-size:12px; opacity:.7; min-width:56px; }
+  .event-body{ flex:1; }
+  .event-title{ font-weight:600; margin-bottom:2px; }
+  .event-desc{ opacity:.75; font-size:12.5px; }
+  .event-remove{ background:none; border:none; color:inherit; opacity:.5; cursor:pointer; }
+  .event-remove:hover{ opacity:1; }
+
+  /* ---- news / announcements feed ---- */
+  .news-compose{ border:1px solid var(--teams-border); border-radius:10px; padding:14px; margin-bottom:20px; }
+  .news-compose input, .news-compose textarea{
+    width:100%; box-sizing:border-box; padding:9px 10px; border-radius:6px;
+    border:1px solid var(--teams-border); background:rgba(127,127,127,.06);
+    color:inherit; font-family:inherit; font-size:13.5px; margin-bottom:8px;
+  }
+  .news-compose textarea{ min-height:70px; resize:vertical; }
+  .news-post{ border:1px solid var(--teams-border); border-radius:10px; padding:16px; margin-bottom:14px; }
+  .news-post.pinned{ box-shadow:inset 0 0 0 1px var(--teams-accent); }
+  .news-post-head{ display:flex; align-items:baseline; gap:8px; margin-bottom:6px; }
+  .news-post-title{ font-weight:700; font-size:15px; }
+  .news-post-meta{ opacity:.55; font-size:11.5px; margin-left:auto; }
+  .news-post-body{ white-space:pre-wrap; font-size:13.5px; line-height:1.5; }
+  .news-pin-tag{ font-size:10px; text-transform:uppercase; letter-spacing:.05em; color:var(--teams-accent); border:1px solid var(--teams-accent); border-radius:4px; padding:1px 5px; }
+</style>
 </head>
 <body>
 
@@ -63,14 +211,36 @@
       </div>
     </div>
 
-    <p class="roster-label" id="channels-label">CHANNELS</p>
-    <div class="roster-list channels-list" id="channels-list">
-      <p class="roster-empty">Loading…</p>
+    <!-- NEW: Teams-style top tabs -->
+    <nav class="top-tabs" id="top-tabs">
+      <button class="top-tab active" data-tab="chat" type="button">
+        <span class="top-tab-icon">💬</span><span>Chat</span>
+      </button>
+      <button class="top-tab" data-tab="calendar" type="button">
+        <span class="top-tab-icon">📅</span><span>Calendar</span>
+      </button>
+      <button class="top-tab" data-tab="news" type="button">
+        <span class="top-tab-icon">📰</span><span>News</span>
+      </button>
+    </nav>
+
+    <!-- NEW: global search (Teams "Search or type a command") -->
+    <div class="global-search">
+      <input id="global-search-input" type="text" placeholder="Search people, channels, messages…" autocomplete="off" />
+      <div class="search-results hidden" id="search-results"></div>
     </div>
 
-    <p class="roster-label">MEMBERS</p>
-    <div class="roster-list" id="roster-list">
-      <p class="roster-empty">Loading…</p>
+    <div id="chat-rail-lists">
+      <p class="roster-label" id="channels-label">CHANNELS</p>
+      <div class="roster-list channels-list" id="channels-list">
+        <p class="roster-empty">Loading…</p>
+      </div>
+
+      <p class="roster-label">MEMBERS</p>
+      <p class="hint-text" style="padding:0 14px 6px;">Type in search above to find a member.</p>
+      <div class="roster-list" id="roster-list">
+        <p class="roster-empty">Loading…</p>
+      </div>
     </div>
 
     <div class="rail-footer">
@@ -97,6 +267,7 @@
           <div class="chat-peer-name" id="peer-name"></div>
           <div class="chat-status"><span class="status-dot" id="status-dot"></span><span id="status-text">Connecting…</span></div>
         </div>
+        <button class="icon-btn" id="mute-btn" style="margin-left:auto;" title="Mute notifications">🔔</button>
       </div>
       <div class="messages" id="messages"></div>
 
@@ -122,8 +293,75 @@
       </div>
       <div class="composer-locked hidden" id="composer-locked">Only admins can post in this channel.</div>
     </div>
+
+    <!-- NEW: Calendar view -->
+    <div id="calendar-view" class="full-view hidden">
+      <div class="full-view-header">
+        <h1>Calendar</h1>
+        <div class="cal-nav">
+          <button id="cal-prev" type="button">←</button>
+          <span class="cal-month-label" id="cal-month-label"></span>
+          <button id="cal-next" type="button">→</button>
+          <button class="btn hidden" id="cal-new-event-btn" type="button" style="width:auto;margin-left:10px;">+ New event</button>
+        </div>
+      </div>
+      <div class="calendar-grid" id="calendar-dow-row"></div>
+      <div class="calendar-grid" id="calendar-grid"></div>
+      <div class="day-events-panel">
+        <h2 id="cal-selected-day-label" style="font-size:14px; opacity:.75; font-weight:600;"></h2>
+        <div id="cal-day-events"></div>
+      </div>
+    </div>
+
+    <!-- NEW: News / announcements view -->
+    <div id="news-view" class="full-view hidden">
+      <div class="full-view-header">
+        <h1>News</h1>
+      </div>
+      <div class="news-compose hidden" id="news-compose">
+        <input id="news-title-input" type="text" placeholder="Headline…" />
+        <textarea id="news-body-input" placeholder="What's the update?"></textarea>
+        <label style="font-size:12.5px; opacity:.8; display:flex; gap:6px; align-items:center; margin-bottom:8px;">
+          <input type="checkbox" id="news-pin-checkbox" style="width:auto;" /> Pin to top
+        </label>
+        <p class="error-text" id="news-error"></p>
+        <button class="btn" id="news-post-btn" style="width:auto;">Post news</button>
+      </div>
+      <div id="news-feed"></div>
+    </div>
   </main>
 </section>
+
+<!-- ---------------- New calendar event modal ---------------- -->
+<div class="modal-backdrop hidden" id="event-modal">
+  <div class="modal">
+    <h2>New event</h2>
+    <p class="subhead">Visible to everyone on the Calendar tab.</p>
+    <div class="field">
+      <label for="event-title">Title</label>
+      <input id="event-title" type="text" />
+    </div>
+    <div class="form-row">
+      <div class="field">
+        <label for="event-date">Date</label>
+        <input id="event-date" type="date" />
+      </div>
+      <div class="field">
+        <label for="event-time">Time (optional)</label>
+        <input id="event-time" type="time" />
+      </div>
+    </div>
+    <div class="field">
+      <label for="event-desc">Description (optional)</label>
+      <input id="event-desc" type="text" />
+    </div>
+    <p class="error-text" id="event-error"></p>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" id="event-cancel" style="width:auto;">Cancel</button>
+      <button class="btn" id="event-save" style="width:auto;">Create event</button>
+    </div>
+  </div>
+</div>
 
 <!-- ---------------- Avatar settings modal ---------------- -->
 <div class="modal-backdrop hidden" id="avatar-modal">
@@ -282,6 +520,7 @@
           <path d="M15 11.5v4.4M12.8 13.7h4.4" stroke-width="1.6"/>
         </svg>
       </button>
+      <button class="icon-btn message-translate-btn" type="button" title="Translate">🌐</button>
     </div>
   </div>
 </template>
@@ -294,10 +533,7 @@
   </button>
 </template>
 
-<!-- ---------------- Reaction picker popup (positioned near the message that was hovered/tapped) ----------------
-     Full emoji set via the emoji-picker-element web component instead of
-     a hardcoded row of 6 buttons. The custom element script is lazy-loaded
-     by app.js the first time this popup is opened, not on initial page load. -->
+<!-- ---------------- Reaction picker popup ---------------- -->
 <div class="reaction-picker hidden" id="reaction-picker">
   <emoji-picker id="emoji-picker-el"></emoji-picker>
 </div>
@@ -345,11 +581,6 @@
   </div>
 </div>
 
-<!--
-  The emoji-picker-element module is NOT loaded here — it's lazy-loaded
-  from app.js the first time the reaction picker opens, so the login
-  screen doesn't have to download it before it's even interactive.
--->
 <script src="app.js"></script>
 </body>
 </html>
