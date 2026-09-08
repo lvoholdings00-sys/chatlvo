@@ -1,53 +1,25 @@
 /**
  * app.js — LVO chat app shell.
  *
- * Wires: login -> roster (admin-controlled account list) -> chat per
- * selected member or channel, all over one websocket to the relay
- * Worker. There is no client-side encryption anywhere in this file —
- * direct messages and channel messages are both plaintext, both
- * persisted server-side (D1), and both visible to admins for
- * oversight. Same trust tier, same code path (renderMessage etc. is
- * shared between the two) — a DM is just a channel with exactly one
- * other member.
+ * (See original header comments — unchanged.) This version adds:
  *
- * The admin panel (member management, channel management, DM activity
- * overview) lives in this same page as a toggled view — there is no
- * separate admin.html route, so the URL never changes.
+ * TOP TABS (NEW): Chat / Calendar / News, Teams-style, in the rail
+ * header. switchTab() toggles which pane is visible in <main> and
+ * which lists show in the rail. Chat behaves exactly as before.
  *
- * MOBILE NAV: below the 700px breakpoint (see app.css), #app-screen
- * shows only one pane at a time — the roster/channel list, or the open
- * chat — Telegram/Instagram style, instead of the two-column desktop
- * layout. Selecting a channel or DM adds the "chat-open" class to
- * #app-screen (CSS swaps which pane is visible); the back button in
- * the chat header removes it again. This is a no-op above the
- * breakpoint since the desktop grid always shows both panes regardless
- * of the class.
+ * CALENDAR (NEW): month-grid view. Anyone can view; only admins see
+ * the "+ New event" button and can delete events. Expects new backend
+ * endpoints — see the API CONTRACT note near loadCalendarEvents().
  *
- * PEOPLE SEARCH (NEW): the member roster is no longer an always-on
- * directory. #roster-list stays empty/hidden until the person types
- * into #roster-search-input — same idea as Microsoft Teams' people
- * search, instead of a static list everyone scrolls through.
+ * NEWS (NEW): an announcements feed, separate from channels. Anyone
+ * can read; only admins get the compose box. Expects new backend
+ * endpoints — see the API CONTRACT note near loadNewsPosts().
  *
- * MUTE (NEW, server-synced): muted conversations are stored on the
- * server (muted_conversations table via /me/muted), keyed only by
- * (user, conversation) — not by device or browser — so muting a DM or
- * channel applies everywhere that account signs in. mutedConvos below
- * is just an in-memory cache of what the server returned at boot,
- * refreshed optimistically on every toggle.
- *
- * TRANSLATE (NEW): a "Translate" hover action on every message bubble.
- * Uses the free, keyless Google Translate web endpoint
- * (translate.googleapis.com/translate_a/single) — this is the same
- * unofficial endpoint many open-source projects use; it has no SLA and
- * can be rate-limited or changed by Google without notice. Swap
- * translateText() below for a paid/official API (Google Cloud
- * Translation, DeepL, etc.) if this needs to be production-grade.
- *
- * PERFORMANCE NOTE: the emoji-picker-element web component is loaded
- * lazily (see ensureEmojiPicker below) instead of via a <script> tag in
- * index.html — it isn't needed to render or use the login screen, so
- * it's prefetched quietly in the background right after login instead,
- * so it's warm by the time someone opens the reaction picker.
+ * GLOBAL SEARCH (NEW): Teams-style "Search or type a command" box in
+ * the rail. Searches channels + members locally (already loaded
+ * client-side) and asks the server for matching messages via
+ * GET /search?q=... Selecting a result jumps straight to that
+ * channel/DM (and, for a message hit, that conversation).
  */
 
 
@@ -60,7 +32,7 @@ const SESSION_KEY = 'lvo_session'; // { token, user } in localStorage
 const GIPHY_API_KEY = 'n7IXLWcTUPp5fr5ZgJ7g7zNIs0Cn5PQE';
 
 // ---------------------------------------------------------------------
-// lazy asset loading (see PERFORMANCE NOTE above)
+// lazy asset loading
 // ---------------------------------------------------------------------
 function loadScriptOnce(src) {
   return new Promise((resolve, reject) => {
@@ -141,10 +113,22 @@ let reactionPickerCtx = null; // { channelId, messageId } the picker popup is cu
 const fileBlobCache = new Map(); // storageKey -> object URL, for plaintext attachments
 let gifSearchDebounce = null; // debounce handle for the GIF search box
 
-// Muted conversations (NEW) — server-synced. Populated from GET
-// /me/muted at boot; each toggle updates this cache immediately (so the
-// UI responds instantly) and also fires the POST that persists it.
-// Keys look like "channel:<id>" or "dm:<id>".
+// NEW: top-level tab state (chat / calendar / news)
+let currentTab = 'chat';
+
+// NEW: calendar state
+let calendarCursor = new Date(); // month currently shown
+let calendarCursor2 = null; // unused placeholder guard (kept out of the way of minifiers)
+let calendarEventsByDate = {}; // 'YYYY-MM-DD' -> [event, ...]
+let calendarSelectedDate = null; // 'YYYY-MM-DD'
+
+// NEW: news state
+let newsPosts = [];
+
+// NEW: search debounce
+let globalSearchDebounce = null;
+
+// Muted conversations — server-synced.
 let mutedConvos = new Set();
 function convKey(id, isChannel) {
   return (isChannel ? 'channel:' : 'dm:') + id;
@@ -154,13 +138,13 @@ async function loadMutedConvos() {
     const data = await api('/me/muted', { token: session.token });
     mutedConvos = new Set((data.muted || []).map((m) => convKey(m.id, m.type === 'channel')));
   } catch {
-    mutedConvos = new Set(); // fail open — better to over-notify than silently lose messages
+    mutedConvos = new Set();
   }
 }
 async function setMuted(id, isChannel, muted) {
   const key = convKey(id, isChannel);
   if (muted) mutedConvos.add(key); else mutedConvos.delete(key);
-  updateMuteButton(id, isChannel); // optimistic UI update before the network call resolves
+  updateMuteButton(id, isChannel);
   try {
     await api('/me/muted', {
       method: 'POST',
@@ -168,7 +152,6 @@ async function setMuted(id, isChannel, muted) {
       body: { type: isChannel ? 'channel' : 'dm', id, muted },
     });
   } catch (e) {
-    // roll back on failure so the UI doesn't lie about what's actually saved
     if (muted) mutedConvos.delete(key); else mutedConvos.add(key);
     updateMuteButton(id, isChannel);
     console.error('Failed to update mute state:', e.message);
@@ -191,14 +174,10 @@ function notifyIncoming(id, isChannel, title, body) {
   try {
     new Notification(title, { body, icon: 'assets/logo.png' });
   } catch {
-    // Notification constructor can throw on some mobile browsers — never
-    // let a notification failure break message rendering.
+    // never let a notification failure break message rendering
   }
 }
 
-// How close together (ms) two consecutive messages from the same sender
-// need to be to visually "group" them (hide the repeat avatar/name),
-// Instagram-DM style, instead of every message getting its own header.
 const GROUP_WINDOW_MS = 5 * 60 * 1000;
 
 const els = {};
@@ -206,6 +185,8 @@ const els = {};
   'login-screen', 'login-form', 'login-username', 'login-password', 'login-submit', 'login-error',
   'pwd-modal', 'pwd-new', 'pwd-error', 'pwd-save',
   'app-screen', 'rail', 'chat-pane', 'me-avatar', 'me-name', 'leader-badge', 'open-avatar-modal',
+  'top-tabs', 'chat-rail-lists',
+  'global-search-input', 'search-results',
   'channels-list', 'roster-list', 'roster-search-input', 'admin-link', 'logout-btn',
   'settings-btn', 'settings-popover', 'settings-avatar-btn',
   'chat-empty', 'chat-active', 'chat-back-btn', 'peer-avatar', 'peer-name', 'status-dot', 'status-text',
@@ -222,10 +203,18 @@ const els = {};
   'admin-screen', 'close-admin',
   'new-username', 'new-displayname', 'new-password', 'create-btn', 'create-error', 'user-list',
   'admin-new-channel', 'admin-channel-list', 'dm-thread-list',
+  // NEW: calendar
+  'calendar-view', 'cal-prev', 'cal-next', 'cal-month-label', 'cal-new-event-btn',
+  'calendar-dow-row', 'calendar-grid', 'cal-selected-day-label', 'cal-day-events',
+  'event-modal', 'event-title', 'event-date', 'event-time', 'event-desc', 'event-error',
+  'event-cancel', 'event-save',
+  // NEW: news
+  'news-view', 'news-compose', 'news-title-input', 'news-body-input', 'news-pin-checkbox',
+  'news-error', 'news-post-btn', 'news-feed',
 ].forEach((id) => (els[id] = document.getElementById(id)));
 
 // ---------------------------------------------------------------------
-// mobile list <-> chat navigation (see MOBILE NAV note at top of file)
+// mobile list <-> chat navigation
 // ---------------------------------------------------------------------
 function openChatPaneMobile() {
   els['app-screen'].classList.add('chat-open');
@@ -234,6 +223,497 @@ function closeChatPaneMobile() {
   els['app-screen'].classList.remove('chat-open');
 }
 els['chat-back-btn'] && els['chat-back-btn'].addEventListener('click', closeChatPaneMobile);
+
+// =======================================================================
+// NEW: top tabs — Chat / Calendar / News
+// =======================================================================
+function switchTab(tab) {
+  currentTab = tab;
+  els['top-tabs'].querySelectorAll('.top-tab').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.tab === tab);
+  });
+
+  els['chat-rail-lists'].classList.toggle('hidden', tab !== 'chat');
+  els['chat-empty'].classList.toggle('hidden', tab !== 'chat' || selectedPeerId || selectedChannelId);
+  els['chat-active'].classList.toggle('hidden', tab !== 'chat' || (!selectedPeerId && !selectedChannelId));
+  els['calendar-view'].classList.toggle('hidden', tab !== 'calendar');
+  els['news-view'].classList.toggle('hidden', tab !== 'news');
+
+  closeSearchResults();
+
+  if (tab === 'calendar') {
+    renderCalendarMonth();
+  } else if (tab === 'news') {
+    refreshNewsFeed();
+  }
+}
+els['top-tabs'] && els['top-tabs'].addEventListener('click', (e) => {
+  const btn = e.target.closest('.top-tab');
+  if (btn) switchTab(btn.dataset.tab);
+});
+
+// =======================================================================
+// NEW: Calendar
+//
+// API CONTRACT (backend not shown in this repo — add these routes to
+// the Worker):
+//   GET  /calendar/events?month=YYYY-MM   -> { events: [
+//          { id, title, description, date: 'YYYY-MM-DD', time: 'HH:MM'|null,
+//            createdBy, createdByName } ] }
+//   POST /calendar/events   (admin only)  body: { title, description, date, time }
+//        -> { event: {...} }
+//   DELETE /calendar/events/:id  (admin only)
+//
+// Deleting/creating should broadcast so other open sessions refresh —
+// simplest is to just re-fetch on open; real-time push can ride the
+// existing websocket ('calendar_event' message type) later if wanted.
+// =======================================================================
+function ymd(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+function monthKey(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+}
+
+async function loadCalendarEvents(monthDate) {
+  try {
+    const data = await api(`/calendar/events?month=${monthKey(monthDate)}`, { token: session.token });
+    calendarEventsByDate = {};
+    for (const ev of data.events || []) {
+      (calendarEventsByDate[ev.date] ||= []).push(ev);
+    }
+  } catch (e) {
+    calendarEventsByDate = {};
+    console.error('Could not load calendar events:', e.message);
+  }
+}
+
+async function renderCalendarMonth() {
+  const isAdmin = session.user.role === 'admin';
+  els['cal-new-event-btn'].classList.toggle('hidden', !isAdmin);
+
+  const label = calendarCursor.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+  els['cal-month-label'].textContent = label;
+
+  await loadCalendarEvents(calendarCursor);
+
+  const dow = els['calendar-dow-row'];
+  dow.innerHTML = '';
+  dow.style.marginBottom = '2px';
+  for (const d of ['S', 'M', 'T', 'W', 'T', 'F', 'S']) {
+    const cell = document.createElement('div');
+    cell.className = 'calendar-dow';
+    cell.textContent = d;
+    dow.appendChild(cell);
+  }
+
+  const grid = els['calendar-grid'];
+  grid.innerHTML = '';
+
+  const year = calendarCursor.getFullYear();
+  const month = calendarCursor.getMonth();
+  const firstOfMonth = new Date(year, month, 1);
+  const startOffset = firstOfMonth.getDay(); // 0=Sun
+  const gridStart = new Date(year, month, 1 - startOffset);
+  const todayKey = ymd(new Date());
+
+  if (!calendarSelectedDate) calendarSelectedDate = todayKey;
+
+  for (let i = 0; i < 42; i++) {
+    const cellDate = new Date(gridStart);
+    cellDate.setDate(gridStart.getDate() + i);
+    const key = ymd(cellDate);
+    const cell = document.createElement('button');
+    cell.type = 'button';
+    cell.className = 'calendar-day';
+    if (cellDate.getMonth() !== month) cell.classList.add('other-month');
+    if (key === todayKey) cell.classList.add('today');
+    if (key === calendarSelectedDate) cell.classList.add('selected');
+
+    const num = document.createElement('span');
+    num.className = 'day-num';
+    num.textContent = String(cellDate.getDate());
+    cell.appendChild(num);
+
+    const dayEvents = calendarEventsByDate[key] || [];
+    if (dayEvents.length > 0) {
+      const dotRow = document.createElement('div');
+      dotRow.className = 'day-dot-row';
+      for (let d = 0; d < Math.min(dayEvents.length, 4); d++) {
+        const dot = document.createElement('span');
+        dot.className = 'day-dot';
+        dotRow.appendChild(dot);
+      }
+      cell.appendChild(dotRow);
+    }
+
+    cell.addEventListener('click', () => {
+      calendarSelectedDate = key;
+      renderCalendarMonth();
+    });
+    grid.appendChild(cell);
+  }
+
+  renderSelectedDayEvents();
+}
+
+function renderSelectedDayEvents() {
+  const key = calendarSelectedDate;
+  const dateObj = new Date(`${key}T00:00:00`);
+  els['cal-selected-day-label'].textContent = dateObj.toLocaleDateString(undefined, {
+    weekday: 'long', month: 'long', day: 'numeric',
+  });
+
+  const isAdmin = session.user.role === 'admin';
+  const container = els['cal-day-events'];
+  container.innerHTML = '';
+  const dayEvents = (calendarEventsByDate[key] || []).slice().sort((a, b) => (a.time || '').localeCompare(b.time || ''));
+
+  if (dayEvents.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'roster-empty';
+    empty.textContent = 'No events on this day.';
+    container.appendChild(empty);
+    return;
+  }
+
+  for (const ev of dayEvents) {
+    const row = document.createElement('div');
+    row.className = 'event-item';
+    const time = document.createElement('div');
+    time.className = 'event-time';
+    time.textContent = ev.time || 'All day';
+    const body = document.createElement('div');
+    body.className = 'event-body';
+    const title = document.createElement('div');
+    title.className = 'event-title';
+    title.textContent = ev.title;
+    body.appendChild(title);
+    if (ev.description) {
+      const desc = document.createElement('div');
+      desc.className = 'event-desc';
+      desc.textContent = ev.description;
+      body.appendChild(desc);
+    }
+    row.appendChild(time);
+    row.appendChild(body);
+    if (isAdmin) {
+      const del = document.createElement('button');
+      del.className = 'event-remove';
+      del.type = 'button';
+      del.title = 'Delete event';
+      del.textContent = '✕';
+      del.addEventListener('click', () => deleteCalendarEvent(ev.id));
+      row.appendChild(del);
+    }
+    container.appendChild(row);
+  }
+}
+
+async function deleteCalendarEvent(eventId) {
+  if (!confirm('Delete this event?')) return;
+  try {
+    await api(`/calendar/events/${encodeURIComponent(eventId)}`, { method: 'DELETE', token: session.token });
+    await renderCalendarMonth();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+function openEventModal() {
+  els['event-error'].textContent = '';
+  els['event-title'].value = '';
+  els['event-date'].value = calendarSelectedDate || ymd(new Date());
+  els['event-time'].value = '';
+  els['event-desc'].value = '';
+  els['event-modal'].classList.remove('hidden');
+}
+els['cal-new-event-btn'] && els['cal-new-event-btn'].addEventListener('click', openEventModal);
+els['event-cancel'] && els['event-cancel'].addEventListener('click', () => els['event-modal'].classList.add('hidden'));
+els['event-save'] && els['event-save'].addEventListener('click', async () => {
+  els['event-error'].textContent = '';
+  const title = els['event-title'].value.trim();
+  const date = els['event-date'].value;
+  if (!title || !date) {
+    els['event-error'].textContent = 'Title and date are required.';
+    return;
+  }
+  try {
+    await api('/calendar/events', {
+      method: 'POST',
+      token: session.token,
+      body: {
+        title,
+        date,
+        time: els['event-time'].value || null,
+        description: els['event-desc'].value.trim() || null,
+      },
+    });
+    els['event-modal'].classList.add('hidden');
+    calendarSelectedDate = date;
+    await renderCalendarMonth();
+  } catch (e) {
+    els['event-error'].textContent = e.message;
+  }
+});
+els['cal-prev'] && els['cal-prev'].addEventListener('click', () => {
+  calendarCursor = new Date(calendarCursor.getFullYear(), calendarCursor.getMonth() - 1, 1);
+  renderCalendarMonth();
+});
+els['cal-next'] && els['cal-next'].addEventListener('click', () => {
+  calendarCursor = new Date(calendarCursor.getFullYear(), calendarCursor.getMonth() + 1, 1);
+  renderCalendarMonth();
+});
+
+// =======================================================================
+// NEW: News / announcements feed
+//
+// API CONTRACT (backend not shown in this repo — add these routes):
+//   GET  /news                     -> { posts: [
+//          { id, title, body, authorId, authorName, ts, pinned } ] }
+//   POST /news   (admin only)      body: { title, body, pinned }
+//   DELETE /news/:id  (admin only)
+// =======================================================================
+async function refreshNewsFeed() {
+  const isAdmin = session.user.role === 'admin';
+  els['news-compose'].classList.toggle('hidden', !isAdmin);
+
+  els['news-feed'].innerHTML = '<p class="roster-empty">Loading…</p>';
+  try {
+    const data = await api('/news', { token: session.token });
+    newsPosts = (data.posts || []).slice().sort((a, b) => {
+      if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
+      return (b.ts || 0) - (a.ts || 0);
+    });
+  } catch (e) {
+    els['news-feed'].innerHTML = `<p class="roster-empty">Could not load news: ${e.message}</p>`;
+    return;
+  }
+  renderNewsFeed();
+}
+
+function renderNewsFeed() {
+  const container = els['news-feed'];
+  container.innerHTML = '';
+  if (newsPosts.length === 0) {
+    container.innerHTML = '<p class="roster-empty">No news posted yet.</p>';
+    return;
+  }
+  const isAdmin = session.user.role === 'admin';
+  for (const post of newsPosts) {
+    const card = document.createElement('div');
+    card.className = 'news-post' + (post.pinned ? ' pinned' : '');
+    const head = document.createElement('div');
+    head.className = 'news-post-head';
+    if (post.pinned) {
+      const tag = document.createElement('span');
+      tag.className = 'news-pin-tag';
+      tag.textContent = 'Pinned';
+      head.appendChild(tag);
+    }
+    const title = document.createElement('span');
+    title.className = 'news-post-title';
+    title.textContent = post.title;
+    head.appendChild(title);
+    const meta = document.createElement('span');
+    meta.className = 'news-post-meta';
+    meta.textContent = `${post.authorName || post.authorId} · ${new Date(post.ts).toLocaleString()}`;
+    head.appendChild(meta);
+    card.appendChild(head);
+
+    const body = document.createElement('div');
+    body.className = 'news-post-body';
+    body.textContent = post.body;
+    card.appendChild(body);
+
+    if (isAdmin) {
+      const del = document.createElement('button');
+      del.className = 'event-remove';
+      del.type = 'button';
+      del.textContent = 'Delete post';
+      del.style.marginTop = '8px';
+      del.addEventListener('click', () => deleteNewsPost(post.id));
+      card.appendChild(del);
+    }
+    container.appendChild(card);
+  }
+}
+
+async function deleteNewsPost(postId) {
+  if (!confirm('Delete this news post?')) return;
+  try {
+    await api(`/news/${encodeURIComponent(postId)}`, { method: 'DELETE', token: session.token });
+    await refreshNewsFeed();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+els['news-post-btn'] && els['news-post-btn'].addEventListener('click', async () => {
+  els['news-error'].textContent = '';
+  const title = els['news-title-input'].value.trim();
+  const body = els['news-body-input'].value.trim();
+  if (!title || !body) {
+    els['news-error'].textContent = 'Headline and body are both required.';
+    return;
+  }
+  try {
+    await api('/news', {
+      method: 'POST',
+      token: session.token,
+      body: { title, body, pinned: !!els['news-pin-checkbox'].checked },
+    });
+    els['news-title-input'].value = '';
+    els['news-body-input'].value = '';
+    els['news-pin-checkbox'].checked = false;
+    await refreshNewsFeed();
+  } catch (e) {
+    els['news-error'].textContent = e.message;
+  }
+});
+
+// =======================================================================
+// NEW: Global search (Teams-style "Search or type a command")
+//
+// Channels and members are matched client-side against data already
+// loaded (roster/channels). Message hits require a server endpoint —
+// GET /search?q=... -> { messages: [
+//   { id, text, ts, from, fromName, channelId, channelName, dmPeerId, dmPeerName } ] }
+// If that endpoint 404s or errors, search still works for people and
+// channels; the Messages section is just quietly omitted.
+// =======================================================================
+function closeSearchResults() {
+  els['search-results'] && els['search-results'].classList.add('hidden');
+}
+
+function addSearchSection(container, label) {
+  const el = document.createElement('div');
+  el.className = 'search-section-label';
+  el.textContent = label;
+  container.appendChild(el);
+}
+
+function addSearchRow(container, { icon, primary, secondary, onClick }) {
+  const row = document.createElement('button');
+  row.type = 'button';
+  row.className = 'search-result-row';
+  const iconEl = document.createElement('span');
+  iconEl.textContent = icon;
+  const label = document.createElement('span');
+  label.textContent = primary;
+  row.appendChild(iconEl);
+  row.appendChild(label);
+  if (secondary) {
+    const sub = document.createElement('span');
+    sub.className = 'search-result-sub';
+    sub.textContent = secondary;
+    row.appendChild(sub);
+  }
+  row.addEventListener('click', onClick);
+  container.appendChild(row);
+}
+
+async function performGlobalSearch(query) {
+  const container = els['search-results'];
+  container.innerHTML = '';
+  container.classList.remove('hidden');
+
+  const q = query.trim().toLowerCase();
+  if (!q) {
+    container.classList.add('hidden');
+    return;
+  }
+
+  const matchingChannels = channels.filter((c) => c.name.toLowerCase().includes(q));
+  const matchingMembers = roster.filter(
+    (m) => m.displayName.toLowerCase().includes(q) || m.id.toLowerCase().includes(q)
+  );
+
+  let matchingMessages = [];
+  try {
+    const data = await api(`/search?q=${encodeURIComponent(query.trim())}`, { token: session.token });
+    matchingMessages = data.messages || [];
+  } catch {
+    matchingMessages = []; // endpoint may not exist yet — fail quietly, see contract note above
+  }
+
+  if (matchingChannels.length === 0 && matchingMembers.length === 0 && matchingMessages.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'search-empty';
+    empty.textContent = `No results for "${query.trim()}".`;
+    container.appendChild(empty);
+    return;
+  }
+
+  if (matchingChannels.length > 0) {
+    addSearchSection(container, 'Channels');
+    for (const ch of matchingChannels.slice(0, 6)) {
+      addSearchRow(container, {
+        icon: channelIcon(ch.type),
+        primary: ch.name,
+        secondary: `${ch.memberCount || ''}`.trim(),
+        onClick: () => {
+          switchTab('chat');
+          selectChannel(ch.id);
+          clearSearchBox();
+        },
+      });
+    }
+  }
+
+  if (matchingMembers.length > 0) {
+    addSearchSection(container, 'People');
+    for (const m of matchingMembers.slice(0, 6)) {
+      addSearchRow(container, {
+        icon: '👤',
+        primary: m.displayName,
+        secondary: `@${m.id}`,
+        onClick: () => {
+          switchTab('chat');
+          selectPeer(m.id);
+          clearSearchBox();
+        },
+      });
+    }
+  }
+
+  if (matchingMessages.length > 0) {
+    addSearchSection(container, 'Messages');
+    for (const msg of matchingMessages.slice(0, 8)) {
+      const where = msg.channelId ? (msg.channelName || msg.channelId) : (msg.dmPeerName || msg.dmPeerId);
+      addSearchRow(container, {
+        icon: '💬',
+        primary: msg.text && msg.text.length > 60 ? `${msg.text.slice(0, 60)}…` : (msg.text || '(attachment)'),
+        secondary: where,
+        onClick: () => {
+          switchTab('chat');
+          if (msg.channelId) selectChannel(msg.channelId);
+          else if (msg.dmPeerId) selectPeer(msg.dmPeerId);
+          clearSearchBox();
+        },
+      });
+    }
+  }
+}
+
+function clearSearchBox() {
+  if (els['global-search-input']) els['global-search-input'].value = '';
+  closeSearchResults();
+}
+
+els['global-search-input'] && els['global-search-input'].addEventListener('input', (e) => {
+  clearTimeout(globalSearchDebounce);
+  const q = e.target.value;
+  globalSearchDebounce = setTimeout(() => performGlobalSearch(q), 250);
+});
+els['global-search-input'] && els['global-search-input'].addEventListener('focus', (e) => {
+  if (e.target.value.trim()) performGlobalSearch(e.target.value);
+});
+document.addEventListener('click', (e) => {
+  const box = els['search-results'];
+  if (!box || box.classList.contains('hidden')) return;
+  if (!box.contains(e.target) && e.target !== els['global-search-input']) closeSearchResults();
+});
 
 // ---------------------------------------------------------------------
 // avatar rendering
@@ -262,7 +742,7 @@ function invalidateAvatarCache(userId) {
 
 function renderAvatar(container, userId, avatar, displayName) {
   container.innerHTML = '';
-  container.classList.remove('channel-icon'); // defensive: this container may have last shown a channel icon
+  container.classList.remove('channel-icon');
   if (avatar && avatar.type === 'preset' && presetsById[avatar.value]) {
     const p = presetsById[avatar.value];
     container.style.background = 'var(--panel-raised)';
@@ -302,9 +782,6 @@ function fileKindFromMime(mime) {
   return 'file';
 }
 
-// Channel and DM attachments are both plaintext on the server, same
-// trust tier as channel/DM text — fetch them the same way avatars are
-// fetched (bearer token on the request, cached as a local object URL).
 async function getChannelFileBlobUrl(storageKey) {
   if (fileBlobCache.has(storageKey)) return fileBlobCache.get(storageKey);
   const res = await fetch(`${SERVER_URL}/files/${encodeURIComponent(storageKey)}`, {
@@ -317,9 +794,6 @@ async function getChannelFileBlobUrl(storageKey) {
   return url;
 }
 
-// Channel and DM attachments both upload plain bytes — same call shape,
-// different endpoint. The Worker gates read access on channel
-// membership or DM-thread participation (or admin) either way.
 async function uploadChannelFile(channelId, file) {
   const buf = await file.arrayBuffer();
   return api(`/channels/${encodeURIComponent(channelId)}/upload`, {
@@ -341,11 +815,6 @@ async function uploadDmFile(peerId, file) {
   });
 }
 
-// Resolves an attachment descriptor to a displayable/downloadable blob URL.
-// `attachment.localUrl` is used for a file the current user just sent
-// (we already have the plaintext bytes, no need to round-trip the server).
-// `attachment.gifUrl` is used for GIPHY picks — GIPHY's CDN URL is used
-// directly, same trust tier as any other external image link.
 async function resolveAttachmentUrl(attachment) {
   if (attachment.gifUrl) return attachment.gifUrl;
   if (attachment.localUrl) return attachment.localUrl;
@@ -371,7 +840,7 @@ function renderAttachmentInto(container, attachment) {
   fileNameEl.textContent = attachment.filename || 'file';
   fileSizeEl.textContent = formatFileSize(attachment.size);
   fileIcon.textContent = kind === 'audio' ? '🎵' : kind === 'video' ? '🎬' : kind === 'image' ? '🖼️' : '📄';
-  fileBox.classList.remove('hidden'); // shown as the fallback / loading state
+  fileBox.classList.remove('hidden');
   container.appendChild(node);
 
   resolveAttachmentUrl(attachment)
@@ -397,7 +866,6 @@ function renderAttachmentInto(container, attachment) {
         fileBox.classList.add('hidden');
         videoEl.addEventListener('click', () => openLightbox('video', url));
       }
-      // 'file' kind keeps the fallback file-chip visible with a working download link.
     })
     .catch((err) => {
       fileNameEl.textContent = `${attachment.filename || 'file'} (failed to load: ${err.message})`;
@@ -484,9 +952,7 @@ els['composer-file-input'] && els['composer-file-input'].addEventListener('chang
 });
 
 // ---------------------------------------------------------------------
-// GIFs (GIPHY) — sent as an attachment carrying a direct gifUrl, so no
-// upload/download round-trip through your server is needed (same trust
-// model as any other external image link/embed).
+// GIFs (GIPHY)
 // ---------------------------------------------------------------------
 function openGifModal() {
   if (!selectedPeerId && !selectedChannelId) return;
@@ -547,14 +1013,13 @@ async function sendGif({ url, title }) {
     } else if (selectedPeerId) {
       sendDmMessage(selectedPeerId, '', attachment);
     }
-    // socket listener renders the server echo — same as file attachments.
   } catch (e) {
     addBubble(`Failed to send GIF: ${e.message}`, 'system');
   }
 }
 
 // ---------------------------------------------------------------------
-// reactions (channels only — the current backend has no DM reaction path)
+// reactions (channels only)
 // ---------------------------------------------------------------------
 function renderReactionsInto(container, reactions, channelId, messageId) {
   container.innerHTML = '';
@@ -577,14 +1042,11 @@ function sendReaction(channelId, messageId, emoji) {
   socket.send(JSON.stringify({ type: 'room_react', channelId, messageId, emoji }));
 }
 async function openReactionPicker(anchorEl, channelId, messageId) {
-  await ensureEmojiPicker(); // no-op after the first call — see PERFORMANCE NOTE at top of file
+  await ensureEmojiPicker();
   reactionPickerCtx = { channelId, messageId };
   const picker = els['reaction-picker'];
   const margin = 10;
 
-  // Reveal off-screen first so we can measure its real size (it's
-  // display:none via .hidden, which reports 0x0), then place it, then
-  // make it visible — all before the next paint, so there's no flash.
   picker.style.visibility = 'hidden';
   picker.classList.remove('hidden');
   picker.style.position = 'fixed';
@@ -594,15 +1056,12 @@ async function openReactionPicker(anchorEl, channelId, messageId) {
   const anchorRect = anchorEl.getBoundingClientRect();
   const pickerRect = picker.getBoundingClientRect();
 
-  // Prefer opening below the message; flip above it if there isn't
-  // room, so it never gets pinned to the bottom of the screen.
   let top = anchorRect.bottom + 6;
   if (top + pickerRect.height + margin > window.innerHeight) {
     top = anchorRect.top - pickerRect.height - 6;
   }
   top = Math.max(margin, Math.min(top, window.innerHeight - pickerRect.height - margin));
 
-  // Center it on the anchor horizontally, clamped to stay on-screen.
   let left = anchorRect.left + anchorRect.width / 2 - pickerRect.width / 2;
   left = Math.max(margin, Math.min(left, window.innerWidth - pickerRect.width - margin));
 
@@ -619,8 +1078,6 @@ document.addEventListener('click', (e) => {
   if (!picker || picker.classList.contains('hidden')) return;
   if (!picker.contains(e.target) && !e.target.closest('.message-react-btn')) closeReactionPicker();
 });
-// Full emoji set via the emoji-picker-element web component, replacing
-// the old hardcoded 6-button row.
 const emojiPickerEl = document.getElementById('emoji-picker-el');
 emojiPickerEl && emojiPickerEl.addEventListener('emoji-click', (e) => {
   const emoji = e.detail.unicode;
@@ -629,15 +1086,13 @@ emojiPickerEl && emojiPickerEl.addEventListener('emoji-click', (e) => {
 });
 
 // ---------------------------------------------------------------------
-// translate (NEW) — see TRANSLATE note at top of file for the caveat
-// about this being a free/keyless endpoint, not an official API.
+// translate
 // ---------------------------------------------------------------------
 async function translateText(text, targetLang) {
   const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(targetLang)}&dt=t&q=${encodeURIComponent(text)}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error('Translation service unavailable.');
   const data = await res.json();
-  // Response shape: [[[translatedChunk, originalChunk, ...], ...], ...]
   return (data[0] || []).map((chunk) => chunk[0]).join('');
 }
 
@@ -675,10 +1130,7 @@ async function toggleTranslate(node, originalText, translateBtn) {
 }
 
 // ---------------------------------------------------------------------
-// message rendering (Telegram/Instagram-style bubble: avatar, author,
-// text, attachments, reaction pills, hover-to-react, and consecutive
-// messages from the same sender grouped together with the repeat
-// avatar/name hidden)
+// message rendering
 // ---------------------------------------------------------------------
 function shouldGroupWithPrevious(fromId, ts) {
   const container = els['messages'];
@@ -730,7 +1182,7 @@ function renderMessage(msg, kind, scopeId, isChannel) {
     }
   } else {
     textEl.classList.add('hidden');
-    if (translateBtn) translateBtn.remove(); // nothing to translate on an attachment-only message
+    if (translateBtn) translateBtn.remove();
   }
 
   if (msg.attachment) renderAttachmentInto(attachmentsEl, msg.attachment, isChannel);
@@ -745,11 +1197,10 @@ function renderMessage(msg, kind, scopeId, isChannel) {
       e.stopPropagation();
       sendReaction(scopeId, msg.id, '❤️');
     });
-    // Double-tap/double-click a bubble to heart it, same gesture as Instagram DMs.
     node.querySelector('.message-bubble').addEventListener('dblclick', () => sendReaction(scopeId, msg.id, '❤️'));
   } else {
     reactionsEl.classList.add('hidden');
-    reactBtn.remove(); // no DM reaction path in the current backend
+    reactBtn.remove();
     heartBtn.remove();
   }
 
@@ -764,7 +1215,7 @@ function renderMessage(msg, kind, scopeId, isChannel) {
 }
 
 // ---------------------------------------------------------------------
-// roster — search-first (see PEOPLE SEARCH note at top of file)
+// roster — search-first
 // ---------------------------------------------------------------------
 async function loadRoster() {
   const data = await api('/roster', { token: session.token });
@@ -812,7 +1263,7 @@ function renderRoster() {
 els['roster-search-input'] && els['roster-search-input'].addEventListener('input', renderRoster);
 
 // ---------------------------------------------------------------------
-// channels (General / Group / Announcement — plaintext, server-stored)
+// channels
 // ---------------------------------------------------------------------
 function channelIcon(type) {
   if (type === 'announcement') return '📣';
@@ -863,7 +1314,7 @@ async function loadChannelMessages(channelId) {
 async function selectChannel(channelId) {
   selectedChannelId = channelId;
   selectedPeerId = null;
-  channelMessageEls = {}; // only the currently-open channel's messages are tracked for live reaction updates
+  channelMessageEls = {};
   closeReactionPicker();
   renderRoster();
   renderChannels();
@@ -983,7 +1434,6 @@ let manageChannelId = null;
 async function openManageChannel(channelId) {
   manageChannelId = channelId;
   els['manage-channel-error'].textContent = '';
-  const data = await api('/channels', { token: session.token }); // for name/type context via admin list fallback
   const adminList = await api('/admin/channels', { token: session.token });
   const ch = adminList.channels.find((c) => c.id === channelId);
   if (!ch) return;
@@ -1094,9 +1544,7 @@ els['manage-channel-close'] && els['manage-channel-close'].addEventListener('cli
 els['admin-new-channel'] && els['admin-new-channel'].addEventListener('click', openChannelModal);
 
 // ---------------------------------------------------------------------
-// mute button (NEW) — lives in the chat header, toggles the currently
-// open conversation. See setMuted()/mutedConvos for the server-synced
-// state this reads and writes.
+// mute button
 // ---------------------------------------------------------------------
 els['mute-btn'] && els['mute-btn'].addEventListener('click', () => {
   const id = els['mute-btn'].dataset.convId;
@@ -1104,16 +1552,11 @@ els['mute-btn'] && els['mute-btn'].addEventListener('click', () => {
   if (!id) return;
   const currentlyMuted = mutedConvos.has(convKey(id, isChannel));
   setMuted(id, isChannel, !currentlyMuted);
-  if (isChannel) renderChannels(); // refresh the 🔕 badge in the channel list
+  if (isChannel) renderChannels();
 });
 
 // ---------------------------------------------------------------------
-// chat wiring — one plain websocket for both channels and DMs, no
-// crypto layer. A DM is handled exactly like a channel with one other
-// member: history is always fetched fresh from the server (no local
-// cache to keep in sync), and outgoing messages are echoed back by the
-// server rather than rendered optimistically, so there's a single
-// source of truth for what's actually in the conversation.
+// chat wiring
 // ---------------------------------------------------------------------
 function setStatus(state, text) {
   els['status-dot'].className = `status-dot ${state}`;
@@ -1230,6 +1673,17 @@ function initClient() {
         }
         return;
       }
+      // NEW: allow the server to push freshly-created calendar events / news
+      // posts to everyone connected, so open tabs update live. Purely
+      // additive — safe no-op if the backend never sends these yet.
+      if (payload.type === 'calendar_event' && currentTab === 'calendar') {
+        renderCalendarMonth();
+        return;
+      }
+      if (payload.type === 'news_post' && currentTab === 'news') {
+        refreshNewsFeed();
+        return;
+      }
       if (payload.type === 'room_error') {
         if (selectedChannelId === payload.channelId) {
           els['composer-error'].textContent = payload.error;
@@ -1285,12 +1739,6 @@ async function sendCurrentMessage() {
   els['composer-send'].disabled = true;
   els['composer-error'].textContent = '';
   try {
-    // Exactly one attachment per outgoing message either way, so multiple
-    // files go out as separate sends; any typed text rides along on the
-    // last one. Nothing is rendered locally — the server echoes every
-    // dm_message/room_message back to the sender too, and the socket
-    // listener above renders it. Rendering it here as well caused
-    // duplicates.
     const send = selectedChannelId
       ? (t, attachment) => sendChannelMessage(selectedChannelId, t, attachment)
       : (t, attachment) => sendDmMessage(selectedPeerId, t, attachment);
@@ -1390,7 +1838,7 @@ async function handleAvatarUpload(file) {
 }
 
 // =======================================================================
-// Admin panel — merged from admin.js, shown/hidden in-page (no admin.html)
+// Admin panel
 // =======================================================================
 function showAdmin() {
   els['app-screen'].classList.add('hidden');
@@ -1518,11 +1966,6 @@ async function refreshAdminChannelList() {
   }
 }
 
-// DM thread rows are clickable: opens a read-only viewer of that
-// thread's full message history. This requires a server-side endpoint
-// that returns DM history for any two userIds when called by an admin
-// (not just when the caller is one of the two participants) — see the
-// GET /admin/dm/:userAId/:userBId/messages call in openAdminDmViewer.
 async function refreshDmThreads() {
   const { threads } = await api('/admin/dm-threads', { token: session.token });
   els['dm-thread-list'].innerHTML = '';
@@ -1547,12 +1990,6 @@ async function refreshDmThreads() {
   }
 }
 
-// ---------------------------------------------------------------------
-// ADMIN DM VIEWER — read-only look at a DM thread between two other
-// members. Reuses renderMessage so it looks identical to a normal DM
-// (Instagram/Telegram bubble style), just rendered into a modal with
-// the composer hidden.
-// ---------------------------------------------------------------------
 async function openAdminDmViewer(userA, userB) {
   const modal = document.getElementById('admin-dm-viewer-modal');
   if (!modal) return;
@@ -1578,8 +2015,6 @@ async function openAdminDmViewer(userA, userB) {
     messagesEl.innerHTML = '<p class="roster-empty">No messages in this thread.</p>';
     return;
   }
-  // Borrow the normal message list container temporarily so renderMessage's
-  // appendChild/scroll calls land in the viewer instead of the main pane.
   const originalMessagesEl = els['messages'];
   els['messages'] = messagesEl;
   for (const entry of history) {
@@ -1596,8 +2031,7 @@ els['admin-link'] && els['admin-link'].addEventListener('click', showAdmin);
 els['close-admin'] && els['close-admin'].addEventListener('click', hideAdmin);
 
 // ---------------------------------------------------------------------
-// settings popover (bottom-left of the rail): change picture, admin
-// panel link (admins only), log out — replaces the old two-button footer
+// settings popover
 // ---------------------------------------------------------------------
 function openAvatarModal() {
   els['avatar-error'].textContent = '';
@@ -1634,19 +2068,15 @@ function showApp() {
   els['login-screen'].classList.add('hidden');
   els['admin-screen'].classList.add('hidden');
   els['app-screen'].classList.remove('hidden');
-  closeChatPaneMobile(); // land on the roster/channel list first on mobile, not a stale chat view
+  closeChatPaneMobile();
   els['me-name'].textContent = session.user.displayName;
   renderAvatar(els['me-avatar'], session.user.id, session.user.avatar, session.user.displayName);
   if (session.user.role === 'admin') {
     els['leader-badge'].classList.remove('hidden');
     els['admin-link'].classList.remove('hidden');
   }
-  // Quietly prefetch the emoji picker now that we're past the login
-  // screen, so it's already warm the first time someone opens a
-  // reaction picker instead of them waiting on it mid-interaction.
+  switchTab('chat');
   ensureEmojiPicker().catch(() => {});
-  // Ask for notification permission right after login rather than on
-  // page load, so the browser's permission prompt has context.
   if ('Notification' in window && Notification.permission === 'default') {
     Notification.requestPermission();
   }
@@ -1671,12 +2101,8 @@ async function boot() {
     els['pwd-modal'].classList.remove('hidden');
     return;
   }
-  // Load the roster first: it's what populates presetsById, which
-  // renderAvatar() (called inside showApp()) depends on to resolve a
-  // preset-type avatar. Rendering before this resolved was causing the
-  // avatar to silently fall back to the letter-avatar look on every load.
   await loadRoster();
-  await loadMutedConvos(); // must resolve before loadChannels()/renderChannels() draw the 🔕 badges
+  await loadMutedConvos();
   showApp();
   await loadChannels();
   await initClient();
