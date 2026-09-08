@@ -118,7 +118,7 @@ const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // must match the Worker's limits
 let pendingFiles = []; // File[] queued in the composer, not yet sent
 let channelMessageEls = {}; // messageId -> { el, reactions } for the currently-open channel only
 let reactionPickerCtx = null; // { channelId, messageId } the picker popup is currently anchored to
-const fileBlobCache = new Map(); // storageKey -> object URL, for plaintext channel attachments
+const fileBlobCache = new Map(); // storageKey -> object URL, for plaintext attachments
 let gifSearchDebounce = null; // debounce handle for the GIF search box
 
 // How close together (ms) two consecutive messages from the same sender
@@ -210,7 +210,7 @@ function renderAvatar(container, userId, avatar, displayName) {
 }
 
 // ---------------------------------------------------------------------
-// files: upload, encryption (DM only), fetching, and rendering
+// files: upload, fetching, and rendering
 // ---------------------------------------------------------------------
 function formatFileSize(bytes) {
   if (!bytes && bytes !== 0) return '';
@@ -226,9 +226,9 @@ function fileKindFromMime(mime) {
   return 'file';
 }
 
-// Channel attachments are plaintext on the server, same trust tier as
-// channel text — fetch them the same way avatars are fetched (bearer
-// token on the request, cached as a local object URL).
+// Channel and DM attachments are both plaintext on the server, same
+// trust tier as channel/DM text — fetch them the same way avatars are
+// fetched (bearer token on the request, cached as a local object URL).
 async function getChannelFileBlobUrl(storageKey) {
   if (fileBlobCache.has(storageKey)) return fileBlobCache.get(storageKey);
   const res = await fetch(`${SERVER_URL}/files/${encodeURIComponent(storageKey)}`, {
@@ -241,11 +241,8 @@ async function getChannelFileBlobUrl(storageKey) {
   return url;
 }
 
-// DM attachments follow the same trust model as DM text: the Worker only
-// ever sees ciphertext. We encrypt the file locally with a random
-// per-file AES-GCM key before upload, then deliver that key to the
-// Channel and DM attachments both upload plain bytes now — same call
-// shape, different endpoint. The Worker gates read access on channel
+// Channel and DM attachments both upload plain bytes — same call shape,
+// different endpoint. The Worker gates read access on channel
 // membership or DM-thread participation (or admin) either way.
 async function uploadChannelFile(channelId, file) {
   const buf = await file.arrayBuffer();
@@ -412,8 +409,8 @@ els['composer-file-input'] && els['composer-file-input'].addEventListener('chang
 
 // ---------------------------------------------------------------------
 // GIFs (GIPHY) — sent as an attachment carrying a direct gifUrl, so no
-// upload/download round-trip through your server or DM encryption is
-// needed (same trust model as any other external image link/embed).
+// upload/download round-trip through your server is needed (same trust
+// model as any other external image link/embed).
 // ---------------------------------------------------------------------
 function openGifModal() {
   if (!selectedPeerId && !selectedChannelId) return;
@@ -1291,7 +1288,7 @@ async function resetPassword(userId) {
 }
 
 async function removeUser(userId, displayName) {
-  if (!confirm(`Remove ${displayName} (@${userId})? This deletes their account and key bundle.`)) return;
+  if (!confirm(`Remove ${displayName} (@${userId})? This deletes their account.`)) return;
   try {
     await api(`/admin/users/${encodeURIComponent(userId)}`, { method: 'DELETE', token: session.token });
     await refreshUserList();
@@ -1349,6 +1346,14 @@ async function refreshAdminChannelList() {
   }
 }
 
+// DM thread rows are clickable: opens a read-only viewer of that
+// thread's full message history. This requires a server-side endpoint
+// that returns DM history for any two userIds when called by an admin
+// (not just when the caller is one of the two participants) — see the
+// GET /admin/dm/:userAId/:userBId/messages call in openAdminDmViewer.
+// That endpoint is not present in the Worker code we've seen; add it
+// there, gated on session.user.role === 'admin', returning the same
+// message shape as /dm/:peerId/messages.
 async function refreshDmThreads() {
   const { threads } = await api('/admin/dm-threads', { token: session.token });
   els['dm-thread-list'].innerHTML = '';
@@ -1360,16 +1365,65 @@ async function refreshDmThreads() {
     return;
   }
   for (const t of threads) {
-    const row = document.createElement('div');
-    row.className = 'user-row';
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'user-row dm-thread-row';
     const meta = document.createElement('div');
     meta.className = 'user-meta';
     meta.innerHTML = `<div>${t.userA.displayName} ↔ ${t.userB.displayName}</div>
                        <div class="user-id">last activity: ${new Date(t.lastActivity).toLocaleString()}</div>`;
     row.appendChild(meta);
+    row.addEventListener('click', () => openAdminDmViewer(t.userA, t.userB));
     els['dm-thread-list'].appendChild(row);
   }
 }
+
+// ---------------------------------------------------------------------
+// ADMIN DM VIEWER — read-only look at a DM thread between two other
+// members. Reuses renderMessage so it looks identical to a normal DM
+// (Instagram/Telegram bubble style), just rendered into a modal with
+// the composer hidden. Requires the /admin/dm/:userAId/:userBId/messages
+// endpoint described above; the markup it targets is added to
+// index.html alongside this file.
+// ---------------------------------------------------------------------
+async function openAdminDmViewer(userA, userB) {
+  const modal = document.getElementById('admin-dm-viewer-modal');
+  if (!modal) return;
+  document.getElementById('admin-dm-viewer-title').textContent = `${userA.displayName} ↔ ${userB.displayName}`;
+  const messagesEl = document.getElementById('admin-dm-viewer-messages');
+  messagesEl.innerHTML = '<p class="roster-empty">Loading…</p>';
+  modal.classList.remove('hidden');
+
+  let history = [];
+  try {
+    const data = await api(
+      `/admin/dm/${encodeURIComponent(userA.id)}/${encodeURIComponent(userB.id)}/messages`,
+      { token: session.token }
+    );
+    history = data.messages || [];
+  } catch (e) {
+    messagesEl.innerHTML = `<p class="roster-empty">Could not load this thread: ${e.message}</p>`;
+    return;
+  }
+
+  messagesEl.innerHTML = '';
+  if (history.length === 0) {
+    messagesEl.innerHTML = '<p class="roster-empty">No messages in this thread.</p>';
+    return;
+  }
+  // Borrow the normal message list container temporarily so renderMessage's
+  // appendChild/scroll calls land in the viewer instead of the main pane.
+  const originalMessagesEl = els['messages'];
+  els['messages'] = messagesEl;
+  for (const entry of history) {
+    renderMessage(entry, 'theirs', entry.from, false);
+  }
+  els['messages'] = originalMessagesEl;
+}
+document.getElementById('admin-dm-viewer-close') &&
+  document.getElementById('admin-dm-viewer-close').addEventListener('click', () => {
+    document.getElementById('admin-dm-viewer-modal').classList.add('hidden');
+  });
 
 els['admin-link'] && els['admin-link'].addEventListener('click', showAdmin);
 els['close-admin'] && els['close-admin'].addEventListener('click', hideAdmin);
