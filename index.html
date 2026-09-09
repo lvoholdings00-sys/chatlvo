@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="app.css?v=20260908b" />
+<link rel="stylesheet" href="app.css?v=20260908c" />
 <link rel="icon" type="image/png" href="assets/logo.png"/>
 <link rel="apple-touch-icon" href="assets/logo.png"/>
 
@@ -424,6 +424,10 @@
       <label for="channel-name">Name</label>
       <input id="channel-name" type="text" placeholder="e.g. Vindex Ops" />
     </div>
+    <div class="field">
+      <label for="channel-icon">Symbol (optional)</label>
+      <input id="channel-icon" type="text" maxlength="16" placeholder="e.g. 🛠️ or VX" />
+    </div>
     <div class="tab-row">
       <button class="tab-btn active" data-channel-type="group">Group</button>
       <button class="tab-btn" data-channel-type="announcement">Announcement</button>
@@ -443,6 +447,10 @@
   <div class="modal">
     <h2 id="manage-channel-title">Manage channel</h2>
     <p class="subhead" id="manage-channel-subhead"></p>
+    <div class="form-row">
+      <input id="manage-channel-icon" type="text" maxlength="16" placeholder="Symbol (e.g. 🛠️ or VX)" />
+      <button class="btn btn-secondary" id="manage-channel-icon-save" style="width:auto;">Save symbol</button>
+    </div>
     <div id="manage-channel-members"></div>
     <p class="roster-label" style="padding-left:0;">ADD MEMBER</p>
     <div class="form-row">
@@ -543,6 +551,11 @@
         </svg>
       </button>
       <button class="icon-btn message-translate-btn" type="button" title="Translate">🌐</button>
+      <button class="icon-btn message-delete-btn hidden" type="button" title="Delete message (admin)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2m-8 0v12a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V7"/>
+        </svg>
+      </button>
     </div>
   </div>
 </template>
@@ -603,6 +616,6 @@
   </div>
 </div>
 
-<script src="app.js?v=20260908b"></script>
+<script src="app.js?v=20260908c"></script>
 </body>
 </html>
