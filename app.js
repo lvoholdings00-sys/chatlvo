@@ -224,8 +224,8 @@ const els = {};
   'reaction-picker', 'lightbox-modal', 'lightbox-image', 'lightbox-video', 'lightbox-close',
   'avatar-modal', 'preset-grid', 'upload-preview', 'upload-input', 'avatar-error', 'avatar-cancel',
   'tab-presets', 'tab-upload',
-  'channel-modal', 'channel-name', 'channel-member-picker', 'channel-error', 'channel-cancel', 'channel-create',
-  'manage-channel-modal', 'manage-channel-title', 'manage-channel-subhead', 'manage-channel-members',
+  'channel-modal', 'channel-name', 'channel-icon', 'channel-member-picker', 'channel-error', 'channel-cancel', 'channel-create',
+  'manage-channel-modal', 'manage-channel-title', 'manage-channel-icon', 'manage-channel-icon-save', 'manage-channel-subhead', 'manage-channel-members',
   'manage-channel-add-select', 'manage-channel-add-btn', 'manage-channel-error', 'manage-channel-delete', 'manage-channel-close',
   'admin-screen', 'close-admin',
   'new-username', 'new-displayname', 'new-password', 'create-btn', 'create-error', 'user-list',
@@ -300,31 +300,24 @@ els['calendar-back-btn'] && els['calendar-back-btn'].addEventListener('click', c
 els['news-back-btn'] && els['news-back-btn'].addEventListener('click', closeChatPaneMobile);
 
 // =======================================================================
-// NEW: Calendar
+// Calendar — GET/POST /calendar, PATCH/DELETE /calendar/:id, world-
+// readable, admin-authored. from/to are inclusive 'YYYY-MM-DD' bounds;
+// we just pass the currently-shown month's first/last day so the list
+// stays small as the calendar grows.
 //
-// API CONTRACT (backend not shown in this repo — add these routes to
-// the Worker):
-//   GET  /calendar/events?month=YYYY-MM   -> { events: [
-//          { id, title, description, date: 'YYYY-MM-DD', time: 'HH:MM'|null,
-//            createdBy, createdByName } ] }
-//   POST /calendar/events   (admin only)  body: { title, description, date, time }
-//        -> { event: {...} }
-//   DELETE /calendar/events/:id  (admin only)
-//
-// Deleting/creating should broadcast so other open sessions refresh —
-// simplest is to just re-fetch on open; real-time push can ride the
-// existing websocket ('calendar_event' message type) later if wanted.
+// Real-time push rides the Relay DO's calendar_event_created /
+// calendar_event_updated / calendar_event_deleted broadcasts (see the
+// websocket handler in initClient()).
 // =======================================================================
 function ymd(date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 }
-function monthKey(date) {
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
-}
 
 async function loadCalendarEvents(monthDate) {
+  const from = ymd(new Date(monthDate.getFullYear(), monthDate.getMonth(), 1));
+  const to = ymd(new Date(monthDate.getFullYear(), monthDate.getMonth() + 1, 0));
   try {
-    const data = await api(`/calendar/events?month=${monthKey(monthDate)}`, { token: session.token });
+    const data = await api(`/calendar?from=${from}&to=${to}`, { token: session.token });
     calendarEventsByDate = {};
     for (const ev of data.events || []) {
       (calendarEventsByDate[ev.date] ||= []).push(ev);
@@ -460,7 +453,7 @@ function renderSelectedDayEvents() {
 async function deleteCalendarEvent(eventId) {
   if (!confirm('Delete this event?')) return;
   try {
-    await api(`/calendar/events/${encodeURIComponent(eventId)}`, { method: 'DELETE', token: session.token });
+    await api(`/calendar/${encodeURIComponent(eventId)}`, { method: 'DELETE', token: session.token });
     await renderCalendarMonth();
   } catch (e) {
     alert(e.message);
@@ -486,7 +479,7 @@ els['event-save'] && els['event-save'].addEventListener('click', async () => {
     return;
   }
   try {
-    await api('/calendar/events', {
+    await api('/calendar', {
       method: 'POST',
       token: session.token,
       body: {
@@ -513,13 +506,11 @@ els['cal-next'] && els['cal-next'].addEventListener('click', () => {
 });
 
 // =======================================================================
-// NEW: News / announcements feed
-//
-// API CONTRACT (backend not shown in this repo — add these routes):
-//   GET  /news                     -> { posts: [
-//          { id, title, body, authorId, authorName, ts, pinned } ] }
-//   POST /news   (admin only)      body: { title, body, pinned }
-//   DELETE /news/:id  (admin only)
+// News / "God's eye" feed — GET /news returns both admin-written posts
+// and auto-ingested GDELT wire items side by side, already sorted
+// pinned-first then newest ({ id, title, body, pinned, auto, source,
+// url, category, createdBy, ts }). POST/PATCH/DELETE /news are
+// admin-only and work the same for either kind of row.
 // =======================================================================
 async function refreshNewsFeed() {
   const isAdmin = session.user.role === 'admin';
@@ -528,10 +519,7 @@ async function refreshNewsFeed() {
   els['news-feed'].innerHTML = '<p class="roster-empty">Loading…</p>';
   try {
     const data = await api('/news', { token: session.token });
-    newsPosts = (data.posts || []).slice().sort((a, b) => {
-      if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
-      return (b.ts || 0) - (a.ts || 0);
-    });
+    newsPosts = data.news || [];
   } catch (e) {
     els['news-feed'].innerHTML = `<p class="roster-empty">Could not load news: ${e.message}</p>`;
     return;
@@ -558,13 +546,30 @@ function renderNewsFeed() {
       tag.textContent = 'Pinned';
       head.appendChild(tag);
     }
+    if (post.auto && post.category) {
+      const catTag = document.createElement('span');
+      catTag.className = 'news-pin-tag';
+      catTag.textContent = post.category;
+      head.appendChild(catTag);
+    }
     const title = document.createElement('span');
     title.className = 'news-post-title';
-    title.textContent = post.title;
+    if (post.auto && post.url) {
+      const link = document.createElement('a');
+      link.href = post.url;
+      link.target = '_blank';
+      link.rel = 'noopener';
+      link.style.color = 'inherit';
+      link.textContent = post.title;
+      title.appendChild(link);
+    } else {
+      title.textContent = post.title;
+    }
     head.appendChild(title);
     const meta = document.createElement('span');
     meta.className = 'news-post-meta';
-    meta.textContent = `${post.authorName || post.authorId} · ${new Date(post.ts).toLocaleString()}`;
+    const byline = post.auto ? (post.source || 'wire') : (post.createdBy ? `@${post.createdBy}` : 'LVO');
+    meta.textContent = `${byline} · ${new Date(post.ts).toLocaleString()}`;
     head.appendChild(meta);
     card.appendChild(head);
 
@@ -737,7 +742,7 @@ async function performGlobalSearch(query) {
     addSearchSection(container, 'Channels');
     for (const ch of matchingChannels.slice(0, 6)) {
       addSearchRow(container, {
-        icon: channelIcon(ch.type),
+        icon: channelIcon(ch),
         primary: ch.name,
         secondary: `${ch.memberCount || ''}`.trim(),
         onClick: () => {
@@ -1279,6 +1284,7 @@ function renderMessage(msg, kind, scopeId, isChannel) {
   const reactBtn = node.querySelector('.message-react-btn');
   const heartBtn = node.querySelector('.message-heart-btn');
   const translateBtn = node.querySelector('.message-translate-btn');
+  const deleteBtn = node.querySelector('.message-delete-btn');
 
   if (kind === 'mine') {
     renderAvatar(avatarEl, session.user.id, session.user.avatar, session.user.displayName);
@@ -1304,6 +1310,38 @@ function renderMessage(msg, kind, scopeId, isChannel) {
   }
 
   if (msg.attachment) renderAttachmentInto(attachmentsEl, msg.attachment, isChannel);
+
+  // Admin moderation: DELETE /channels/:id/messages/:id for channel
+  // messages, DELETE /admin/dm-messages/:id for DMs — either way it's a
+  // single-message removal, and the Relay DO pushes a live
+  // room_message_deleted/dm_message_deleted event to anyone else with
+  // this thread open (handled in initClient()).
+  if (deleteBtn) {
+    if (session.user.role === 'admin') {
+      deleteBtn.classList.remove('hidden');
+      deleteBtn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        if (!confirm('Delete this message for everyone?')) return;
+        try {
+          if (isChannel) {
+            await api(`/channels/${encodeURIComponent(scopeId)}/messages/${encodeURIComponent(msg.id)}`, {
+              method: 'DELETE',
+              token: session.token,
+            });
+            const store = channelMessageEls[scopeId];
+            if (store) store.delete(msg.id);
+          } else {
+            await api(`/admin/dm-messages/${encodeURIComponent(msg.id)}`, { method: 'DELETE', token: session.token });
+          }
+          node.remove();
+        } catch (err) {
+          alert(err.message);
+        }
+      });
+    } else {
+      deleteBtn.remove();
+    }
+  }
 
   if (isChannel) {
     renderReactionsInto(reactionsEl, msg.reactions || {}, scopeId, msg.id);
@@ -1417,9 +1455,15 @@ function renderRoster() {
 // ---------------------------------------------------------------------
 // channels
 // ---------------------------------------------------------------------
-function channelIcon(type) {
-  if (type === 'announcement') return '📣';
-  return '#';
+// Accepts either a channel object ({ icon, type }) or a bare type string
+// for backward-compat call sites. A custom admin-set `icon` always wins;
+// otherwise falls back to the type's default glyph.
+function channelIcon(ch) {
+  if (ch && typeof ch === 'object') {
+    if (ch.icon) return ch.icon;
+    return ch.type === 'announcement' ? '📣' : '#';
+  }
+  return ch === 'announcement' ? '📣' : '#';
 }
 
 async function loadChannels() {
@@ -1435,7 +1479,7 @@ function renderChannels() {
     btn.className = 'roster-item' + (ch.id === selectedChannelId ? ' active' : '');
     const icon = document.createElement('div');
     icon.className = 'avatar avatar-sm channel-icon';
-    icon.textContent = channelIcon(ch.type);
+    icon.textContent = channelIcon(ch);
     const name = document.createElement('span');
     name.className = 'roster-name';
     name.textContent = ch.name;
@@ -1479,7 +1523,7 @@ async function selectChannel(channelId) {
   els['peer-avatar'].innerHTML = '';
   els['peer-avatar'].classList.add('channel-icon');
   els['peer-avatar'].style.background = '';
-  els['peer-avatar'].textContent = channelIcon(ch ? ch.type : 'group');
+  els['peer-avatar'].textContent = channelIcon(ch || 'group');
   els['peer-name'].textContent = ch ? ch.name : channelId;
   setStatus(socket && socket.readyState === 1 ? 'secured' : '', socket && socket.readyState === 1 ? 'Connected' : 'Connecting…');
 
@@ -1541,6 +1585,7 @@ function openChannelModal() {
   els['channel-modal'].querySelectorAll('[data-channel-type]').forEach((b) => {
     b.classList.toggle('active', b.dataset.channelType === 'group');
   });
+  if (els['channel-icon']) els['channel-icon'].value = '';
   els['channel-member-picker'].innerHTML = '';
   for (const member of roster) {
     const row = document.createElement('label');
@@ -1572,8 +1617,13 @@ els['channel-create'] && els['channel-create'].addEventListener('click', async (
     return;
   }
   const memberIds = Array.from(els['channel-member-picker'].querySelectorAll('input:checked')).map((cb) => cb.value);
+  const icon = els['channel-icon'] ? els['channel-icon'].value.trim() : '';
   try {
-    await api('/channels', { method: 'POST', token: session.token, body: { name, type: pendingChannelType, memberIds } });
+    await api('/channels', {
+      method: 'POST',
+      token: session.token,
+      body: { name, type: pendingChannelType, memberIds, icon: icon || null },
+    });
     els['channel-modal'].classList.add('hidden');
     await loadChannels();
     await refreshAdminChannelList();
@@ -1595,6 +1645,11 @@ async function openManageChannel(channelId) {
     ? 'Only members with posting rights can send here. Everyone else reads.'
     : 'Everyone in this channel can post.';
   els['manage-channel-delete'].classList.toggle('hidden', ch.id === 'general');
+  // /admin/channels doesn't carry `icon` today — fall back to the
+  // regular /channels list (which does) if this admin happens to be a
+  // member; otherwise the field just starts blank and Save still works.
+  const localCh = channels.find((c) => c.id === channelId);
+  if (els['manage-channel-icon']) els['manage-channel-icon'].value = (ch.icon || (localCh && localCh.icon) || '');
 
   const membersData = await api(`/channels/${encodeURIComponent(channelId)}/members`, { token: session.token });
   els['manage-channel-members'].innerHTML = '';
@@ -1663,6 +1718,21 @@ async function openManageChannel(channelId) {
 
   els['manage-channel-modal'].classList.remove('hidden');
 }
+
+els['manage-channel-icon-save'] && els['manage-channel-icon-save'].addEventListener('click', async () => {
+  if (!manageChannelId) return;
+  const icon = els['manage-channel-icon'].value.trim();
+  try {
+    await api(`/channels/${encodeURIComponent(manageChannelId)}`, {
+      method: 'PATCH',
+      token: session.token,
+      body: { icon: icon || null },
+    });
+    await loadChannels();
+  } catch (e) {
+    els['manage-channel-error'].textContent = e.message;
+  }
+});
 
 els['manage-channel-add-btn'] && els['manage-channel-add-btn'].addEventListener('click', async () => {
   const uid = els['manage-channel-add-select'].value;
@@ -1836,17 +1906,60 @@ function initClient() {
         }
         return;
       }
-      // NEW: allow the server to push freshly-created calendar events / news
-      // posts to everyone connected, so open tabs update live. Purely
-      // additive — safe no-op if the backend never sends these yet.
-      if (payload.type === 'calendar_event' && currentTab === 'calendar') {
+      // Calendar/news broadcasts from the Relay DO (see broadcastToRelay()
+      // calls in the Worker) — only worth a re-fetch if that tab is open.
+      if (
+        (payload.type === 'calendar_event_created' ||
+          payload.type === 'calendar_event_updated' ||
+          payload.type === 'calendar_event_deleted') &&
+        currentTab === 'calendar'
+      ) {
         renderCalendarMonth();
         return;
       }
-      if (payload.type === 'news_post' && currentTab === 'news') {
+      if (
+        (payload.type === 'news_created' || payload.type === 'news_updated' || payload.type === 'news_deleted') &&
+        currentTab === 'news'
+      ) {
         refreshNewsFeed();
         return;
       }
+
+      // Admin moderation — a single message vanished. Pull it out of the
+      // open thread (if this client has it open) and drop it from the
+      // reaction cache so a stray reaction event can't resurrect it.
+      if (payload.type === 'room_message_deleted') {
+        const store = channelMessageEls[payload.channelId];
+        const entry = store && store.get(payload.messageId);
+        if (entry) {
+          entry.el.remove();
+          store.delete(payload.messageId);
+        }
+        return;
+      }
+      if (payload.type === 'dm_message_deleted') {
+        const node = els['messages'].querySelector(`[data-message-id="${CSS.escape(payload.messageId)}"]`);
+        if (node) node.remove();
+        return;
+      }
+
+      // Channel roster/metadata changed elsewhere (name, icon, membership) —
+      // just reload the channel list; cheap and keeps icons/names in sync.
+      if (
+        payload.type === 'channel_created' ||
+        payload.type === 'channel_updated' ||
+        payload.type === 'channel_deleted' ||
+        payload.type === 'channel_removed'
+      ) {
+        loadChannels().catch(() => {});
+        if (payload.type === 'channel_removed' && selectedChannelId === payload.channelId) {
+          selectedChannelId = null;
+          els['chat-active'].classList.add('hidden');
+          els['chat-empty'].classList.remove('hidden');
+        }
+        return;
+      }
+
       if (payload.type === 'room_error') {
         if (selectedChannelId === payload.channelId) {
           els['composer-error'].textContent = payload.error;
@@ -2114,7 +2227,7 @@ async function refreshAdminChannelList() {
     const meta = document.createElement('div');
     meta.className = 'user-meta';
     const last = ch.lastActivity ? new Date(ch.lastActivity).toLocaleString() : 'no messages yet';
-    meta.innerHTML = `<div>${channelIcon(ch.type)} ${ch.name} <span class="channel-type-badge">${ch.type}</span></div>
+    meta.innerHTML = `<div>${channelIcon(ch)} ${ch.name} <span class="channel-type-badge">${ch.type}</span></div>
                        <div class="user-id">${ch.memberCount} member${ch.memberCount === 1 ? '' : 's'} · ${ch.messageCount} message${ch.messageCount === 1 ? '' : 's'} · last: ${last}</div>`;
     row.appendChild(meta);
 
